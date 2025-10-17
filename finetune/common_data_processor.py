@@ -45,22 +45,71 @@ class BaseDataProcessor(ABC):
         """处理原始数据"""
         pass
     
-    def save_processed_data(self, data, data_type):
-        """保存处理后的数据"""
-        file_path = self.dataset_path / f"{data_type}_data.pkl"
+    def save_processed_data(self, data, data_type, data_source=None):
+        """保存处理后的数据
+        
+        Args:
+            data: 要保存的数据
+            data_type: 数据类型（train/val/test）
+            data_source: 数据来源（qlib/sina等）
+        """
+        # 获取数据来源
+        if data_source is None:
+            if hasattr(self, 'data_source'):
+                data_source = self.data_source
+            else:
+                data_source = self.__class__.__name__.replace('DataProcessor', '').lower()
+        
+        # 创建数据来源特定的目录
+        source_dir = self.dataset_path / data_source
+        source_dir.mkdir(exist_ok=True, parents=True)
+        
+        # 构建文件路径，包含数据来源信息
+        file_path = source_dir / f"{data_type}_data.pkl"
+        
+        # 记录数据统计信息
+        symbol_count = len(data)
+        total_rows = sum(len(df) for df in data.values())
+        logger.info(f"保存{data_source}/{data_type}数据集: {symbol_count}支股票, 共{total_rows}行数据")
+        
+        # 使用最高级别的pickle协议保存
+        start_time = time.time()
         with open(file_path, 'wb') as f:
-            pickle.dump(data, f)
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        # 计算和记录统计信息
+        elapsed = time.time() - start_time
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+        logger.info(f"数据保存完成，耗时 {elapsed:.2f} 秒, 文件大小: {file_size:.2f} MB")
+        
         return file_path
     
     def run_pipeline(self):
         """运行完整的数据处理流程"""
-        logger.info(f"运行数据处理流程: {self.__class__.__name__}")
+        # 获取数据来源名称
+        data_source = self.__class__.__name__.replace('DataProcessor', '').lower()
+        self.data_source = data_source
+        
+        logger.info(f"运行{data_source}数据处理流程")
+        
+        # 下载和处理数据
+        start_time = time.time()
         self.download_data()
         processed_data = self.process_raw_data()
-        train_path = self.save_processed_data(processed_data['train'], 'train')
-        val_path = self.save_processed_data(processed_data['val'], 'val')
-        test_path = self.save_processed_data(processed_data['test'], 'test')
-        logger.info(f"数据处理完成。训练数据: {train_path}, 验证数据: {val_path}, 测试数据: {test_path}")
+        
+        # 保存处理后的数据
+        train_path = self.save_processed_data(processed_data['train'], 'train', data_source)
+        val_path = self.save_processed_data(processed_data['val'], 'val', data_source)
+        test_path = self.save_processed_data(processed_data['test'], 'test', data_source)
+        
+        # 计算总耗时
+        total_time = time.time() - start_time
+        logger.info(f"数据处理完成，总耗时: {total_time:.2f} 秒")
+        logger.info(f"数据存储路径:")
+        logger.info(f"  - 训练数据: {train_path}")
+        logger.info(f"  - 验证数据: {val_path}")
+        logger.info(f"  - 测试数据: {test_path}")
+        
         return {'train': train_path, 'val': val_path, 'test': test_path}
 
 
@@ -448,13 +497,18 @@ class FinancialDataset(Dataset):
         # interfering with other random processes (e.g., in model initialization).
         self.py_rng = random.Random(self.config.seed)
 
+        # 获取数据来源
+        self.data_source = getattr(self.config, 'data_source', 'qlib')
+        
         # Set paths and number of samples based on the data type.
         if data_type == 'train':
-            self.data_path = f"{self.config.dataset_path}/train_data.pkl"
+            self.data_path = f"{self.config.dataset_path}/{self.data_source}/train_data.pkl"
             self.n_samples = self.config.n_train_iter
         else:
-            self.data_path = f"{self.config.dataset_path}/val_data.pkl"
+            self.data_path = f"{self.config.dataset_path}/{self.data_source}/val_data.pkl"
             self.n_samples = self.config.n_val_iter
+            
+        logger.info(f"加载{self.data_source}/{data_type}数据集: {self.data_path}")
 
         with open(self.data_path, 'rb') as f:
             self.data = pickle.load(f)
@@ -467,7 +521,7 @@ class FinancialDataset(Dataset):
 
         # Pre-compute all possible (symbol, start_index) pairs.
         self.indices = []
-        print(f"[{data_type.upper()}] Pre-computing sample indices...")
+        logger.info(f"[{data_type.upper()}] Pre-computing sample indices...")
         for symbol in self.symbols:
             df = self.data[symbol].reset_index()
             series_len = len(df)
@@ -490,7 +544,7 @@ class FinancialDataset(Dataset):
         # The effective dataset size is the minimum of the configured iterations
         # and the total number of available samples.
         self.n_samples = min(self.n_samples, len(self.indices))
-        print(f"[{data_type.upper()}] Found {len(self.indices)} possible samples. Using {self.n_samples} per epoch.")
+        logger.info(f"[{data_type.upper()}] Found {len(self.indices)} possible samples. Using {self.n_samples} per epoch.")
 
     def set_epoch_seed(self, epoch: int):
         """
@@ -588,5 +642,5 @@ if __name__ == '__main__':
     config.sina_symbols = ['AAPL', 'MSFT', 'GOOG']  # 示例股票代码
 
     # 使用工厂创建处理器
-    processor = DataProcessorFactory.create_processor('qlib', config)
+    processor = DataProcessorFactory.create_processor('sina', config)
     processor.run_pipeline()

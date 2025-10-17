@@ -1,7 +1,14 @@
-figures/qlib_bin.tar.gz
-finetune/data
-finetune/qlib_bin
-finetune/outputs
+# Project specific - Data and Models
+finetune/qlib_bin.tar.gz
+finetune/data/
+finetune/qlib_bin/
+finetune/outputs/
+finetune/model_history/
+outputs/
+data/processed_datasets/
+qlib_bin/
+model_history/
+
 
 
 # Python

@@ -12,17 +12,26 @@ import json
 import time
 import logging
 import argparse
+import pickle
+import random
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from time import gmtime, strftime
+import traceback
+from time import strftime
 from pathlib import Path
+from datetime import datetime, timedelta
+from collections import defaultdict
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # 确保项目根目录在路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import Config
-from model.kronos import KronosTokenizer, Kronos
+from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 from utils.training_pipeline_utils import (
     setup_logging,
     setup_ddp,
@@ -35,10 +44,16 @@ from utils.training_pipeline_utils import (
     setup_comet_logger,
     save_model_checkpoint,
     save_training_summary,
-    predict_latest_data,
-    save_pipeline_config
+    predict_future_trends,
+    save_pipeline_config,
+    evaluate_tokenizer_on_test_data,
+    evaluate_predictor_on_test_data,
+    evaluate_model_on_test_data,
+    evaluate_models_during_training,
+    update_best_model_paths,
+    get_shanghai_time
 )
-from common_data_processor import DataProcessorFactory
+from common_data_processor import DataProcessorFactory, FinancialDataset
 
 # 全局日志记录器
 logger = logging.getLogger('KronosPipeline')
@@ -83,6 +98,21 @@ class KronosTrainingPipeline:
         # 设置随机种子
         set_seed(config.seed)
         
+        # 记录模型评估的最佳损失
+        self.best_tokenizer_test_loss = float('inf')
+        self.best_predictor_test_loss = float('inf')
+        
+        # 初始化历史最佳模型路径
+        # 如果配置中没有设置，则使用当前的最佳模型路径
+        if not hasattr(config, 'his_best_tokenizer_path') or not config.his_best_tokenizer_path:
+            config.his_best_tokenizer_path = config.finetuned_tokenizer_path
+        if not hasattr(config, 'his_best_predictor_path') or not config.his_best_predictor_path:
+            config.his_best_predictor_path = config.finetuned_predictor_path
+            
+        # 创建模型历史记录目录
+        if hasattr(config, 'model_history_dir') and config.model_history_dir:
+            os.makedirs(config.model_history_dir, exist_ok=True)
+        
     def setup_distributed(self):
         """设置分布式训练环境"""
         if not self.use_gpu:
@@ -108,11 +138,31 @@ class KronosTrainingPipeline:
                 processor = DataProcessorFactory.create_processor(self.data_source, self.config)
                 result = processor.run_pipeline()
                 logger.info(f"数据处理完成: {result}")
+                
+                # 加载测试数据，用于每个训练阶段的评估
+                self.load_test_data()
                 return True
             except Exception as e:
                 logger.error(f"处理数据时出错: {str(e)}")
                 return False
         return True  # 非主进程直接返回成功
+        
+    def load_test_data(self):
+        """加载测试数据，用于模型评估"""
+        if self.is_master:
+            try:
+                test_data_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
+                logger.info(f"加载测试数据: {test_data_path}")
+                if os.path.exists(test_data_path):
+                    with open(test_data_path, 'rb') as f:
+                        self.test_data = pickle.load(f)
+                    logger.info(f"测试数据加载成功，包含 {len(self.test_data)} 支股票")
+                else:
+                    logger.warning(f"测试数据文件不存在: {test_data_path}")
+                    self.test_data = None
+            except Exception as e:
+                logger.error(f"加载测试数据时出错: {str(e)}")
+                self.test_data = None
     
     def train_tokenizer(self):
         """训练分词模型"""
@@ -164,6 +214,7 @@ class KronosTrainingPipeline:
         # 训练循环
         best_val_loss = float('inf')
         batch_idx_global_train = 0
+        evaluation_history = []  # 记录每个epoch的评估信息
         
         for epoch_idx in range(self.config.epochs):
             epoch_start_time = time.time()
@@ -266,7 +317,37 @@ class KronosTrainingPipeline:
                 if comet_logger:
                     comet_logger.log_metric('val_tokenizer_loss_epoch', avg_val_loss, epoch=epoch_idx)
                 
-                if avg_val_loss < best_val_loss:
+                # 保存当前模型到临时路径
+                temp_save_path = f"{self.tokenizer_save_dir}/checkpoints/epoch_{epoch_idx + 1}"
+                os.makedirs(temp_save_path, exist_ok=True)
+                if self.use_gpu and torch.cuda.device_count() > 1:
+                    model.module.save_pretrained(temp_save_path)
+                else:
+                    model.save_pretrained(temp_save_path)
+                
+                # 在测试集上评估当前模型
+                if hasattr(self, 'test_data') and self.test_data is not None:
+                    # 使用工具函数评估模型
+                    best_path = f"{self.tokenizer_save_dir}/checkpoints/best_model"
+                    self.best_tokenizer_test_loss, eval_info = evaluate_models_during_training(
+                        epoch_idx=epoch_idx,
+                        current_model_path=temp_save_path,
+                        config=self.config,
+                        test_data=self.test_data,
+                        device=self.device,
+                        model_type='tokenizer',
+                        best_loss=self.best_tokenizer_test_loss,
+                        save_path=best_path
+                    )
+                    # 记录评估信息
+                    evaluation_history.append(eval_info)
+                    
+                    # 记录到Comet（如果启用）
+                    if comet_logger and os.path.exists(best_path):
+                        comet_logger.log_model("best_model", best_path)
+                
+                # 如果没有测试数据，则使用验证损失作为标准
+                elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = f"{self.tokenizer_save_dir}/checkpoints/best_model"
                     if self.use_gpu and torch.cuda.device_count() > 1:
@@ -283,17 +364,39 @@ class KronosTrainingPipeline:
         
         # 保存训练摘要
         if self.is_master:
+            # 从评估历史中找出损失最小的模型
+            best_eval = None
+            if evaluation_history:
+                best_eval = min(evaluation_history, key=lambda x: x.get('best_loss', float('inf')))
+            
+            shanghai_time = get_shanghai_time()
             summary = {
-                'start_time': strftime("%Y-%m-%dT%H-%M-%S", gmtime()),
-                'end_time': strftime("%Y-%m-%dT%H-%M-%S", gmtime()),
+                'start_time': shanghai_time.strftime("%Y-%m-%dT%H-%M-%S"),
+                'end_time': shanghai_time.strftime("%Y-%m-%dT%H-%M-%S"),
                 'total_time': format_time(time.time() - start_time),
                 'best_val_loss': best_val_loss,
+                'best_test_loss': self.best_tokenizer_test_loss if hasattr(self, 'best_tokenizer_test_loss') else None,
                 'epochs': self.config.epochs,
                 'world_size': self.world_size,
                 'device': str(self.device),
+                'evaluation_history': evaluation_history,  # 添加评估历史
+                'final_best_model': {
+                    'epoch': best_eval['epoch'] if best_eval else None,
+                    'name': best_eval['best_model_name'] if best_eval else None,
+                    'path': best_eval['best_model_path'] if best_eval else None,
+                    'loss': best_eval['best_loss'] if best_eval else None,
+                }
             }
             save_training_summary(self.tokenizer_save_dir, summary)
-            logger.info("分词模型训练完成")
+            
+            # 更新配置中的最佳分词模型路径，供后续训练预测模型使用
+            best_model_path = f"{self.tokenizer_save_dir}/checkpoints/best_model"
+            if os.path.exists(best_model_path):
+                self.config.finetuned_tokenizer_path = best_model_path
+                logger.info(f"分词模型训练完成，最佳模型路径已更新: {best_model_path}")
+                logger.info(f"最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
+            else:
+                logger.warning(f"最佳模型路径不存在: {best_model_path}")
             
             if comet_logger:
                 comet_logger.end()
@@ -307,7 +410,7 @@ class KronosTrainingPipeline:
         
         # 初始化分词模型和预测模型
         try:
-            tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path)
+            tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path, local_files_only=True)
             tokenizer.eval().to(self.device)
             logger.info("分词模型加载完成")
             
@@ -355,6 +458,7 @@ class KronosTrainingPipeline:
         # 训练循环
         best_val_loss = float('inf')
         batch_idx_global = 0
+        evaluation_history = []  # 记录每个epoch的评估信息
         
         for epoch_idx in range(self.config.epochs):
             epoch_start_time = time.time()
@@ -380,11 +484,10 @@ class KronosTrainingPipeline:
                 token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
                 
                 # 前向传播和损失计算
+                logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                 if self.use_gpu and torch.cuda.device_count() > 1:
-                    logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                     loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 else:
-                    logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                     loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 
                 # 反向传播和优化
@@ -427,11 +530,10 @@ class KronosTrainingPipeline:
                     token_in = [token_seq_0[:, :-1], token_seq_1[:, :-1]]
                     token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
                     
+                    logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                     if self.use_gpu and torch.cuda.device_count() > 1:
-                        logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                         val_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     else:
-                        logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
                         val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     
                     tot_val_loss += val_loss.item()
@@ -459,7 +561,37 @@ class KronosTrainingPipeline:
                 if comet_logger:
                     comet_logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
                 
-                if avg_val_loss < best_val_loss:
+                # 保存当前模型到临时路径
+                temp_save_path = f"{self.predictor_save_dir}/checkpoints/epoch_{epoch_idx + 1}"
+                os.makedirs(temp_save_path, exist_ok=True)
+                if self.use_gpu and torch.cuda.device_count() > 1:
+                    model.module.save_pretrained(temp_save_path)
+                else:
+                    model.save_pretrained(temp_save_path)
+                
+                # 在测试集上评估当前模型
+                if hasattr(self, 'test_data') and self.test_data is not None:
+                    # 使用工具函数评估模型
+                    best_path = f"{self.predictor_save_dir}/checkpoints/best_model"
+                    self.best_predictor_test_loss, eval_info = evaluate_models_during_training(
+                        epoch_idx=epoch_idx,
+                        current_model_path=temp_save_path,
+                        config=self.config,
+                        test_data=self.test_data,
+                        device=self.device,
+                        model_type='predictor',
+                        best_loss=self.best_predictor_test_loss,
+                        save_path=best_path
+                    )
+                    # 记录评估信息
+                    evaluation_history.append(eval_info)
+                    
+                    # 记录到Comet（如果启用）
+                    if comet_logger and os.path.exists(best_path):
+                        comet_logger.log_model("best_model", best_path)
+                
+                # 如果没有测试数据，则使用验证损失作为标准
+                elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = f"{self.predictor_save_dir}/checkpoints/best_model"
                     if self.use_gpu and torch.cuda.device_count() > 1:
@@ -467,6 +599,8 @@ class KronosTrainingPipeline:
                     else:
                         model.save_pretrained(save_path)
                     logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
+                    if comet_logger:
+                        comet_logger.log_model("best_model", save_path)
             
             # 同步所有进程
             if self.use_gpu and torch.cuda.device_count() > 1:
@@ -474,44 +608,139 @@ class KronosTrainingPipeline:
         
         # 保存训练摘要
         if self.is_master:
+            # 从评估历史中找出损失最小的模型
+            best_eval = None
+            if evaluation_history:
+                best_eval = min(evaluation_history, key=lambda x: x.get('best_loss', float('inf')))
+            
+            shanghai_time = get_shanghai_time()
             summary = {
-                'start_time': strftime("%Y-%m-%dT%H-%M-%S", gmtime()),
-                'end_time': strftime("%Y-%m-%dT%H-%M-%S", gmtime()),
+                'start_time': shanghai_time.strftime("%Y-%m-%dT%H-%M-%S"),
+                'end_time': shanghai_time.strftime("%Y-%m-%dT%H-%M-%S"),
                 'total_time': format_time(time.time() - start_time),
                 'best_val_loss': best_val_loss,
+                'best_test_loss': self.best_predictor_test_loss if hasattr(self, 'best_predictor_test_loss') else None,
                 'epochs': self.config.epochs,
                 'world_size': self.world_size,
                 'device': str(self.device),
+                'evaluation_history': evaluation_history,  # 添加评估历史
+                'final_best_model': {
+                    'epoch': best_eval['epoch'] if best_eval else None,
+                    'name': best_eval['best_model_name'] if best_eval else None,
+                    'path': best_eval['best_model_path'] if best_eval else None,
+                    'loss': best_eval['best_loss'] if best_eval else None,
+                }
             }
             save_training_summary(self.predictor_save_dir, summary)
-            logger.info("预测模型训练完成")
+            
+            # 更新配置中的最佳预测模型路径，供后续预测使用
+            best_model_path = f"{self.predictor_save_dir}/checkpoints/best_model"
+            if os.path.exists(best_model_path):
+                self.config.finetuned_predictor_path = best_model_path
+                logger.info(f"预测模型训练完成，最佳模型路径已更新: {best_model_path}")
+                logger.info(f"最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
+            else:
+                logger.warning(f"最佳模型路径不存在: {best_model_path}")
             
             if comet_logger:
                 comet_logger.end()
         
         return True
     
-    def predict(self):
-        """使用训练好的模型进行预测"""
+    def evaluate_models(self):
+        """验证最佳模型是否已经选择完成"""
         if not self.is_master:
             return True
             
-        logger.info("开始进行预测...")
+        logger.info("验证最佳模型选择...")
         try:
-            # 加载模型
-            tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path)
-            tokenizer.eval().to(self.device)
+            # 检查配置中的路径是否已经被更新（应该在训练完成时已更新）
+            if not self.config.finetuned_tokenizer_path or not self.config.finetuned_predictor_path:
+                logger.error("配置中的模型路径未设置，训练可能未正确完成")
+                return False
             
-            model = Kronos.from_pretrained(self.config.finetuned_predictor_path)
-            model.eval().to(self.device)
+            # 验证路径是否存在
+            if not os.path.exists(self.config.finetuned_tokenizer_path):
+                logger.error(f"最佳分词模型路径不存在: {self.config.finetuned_tokenizer_path}")
+                return False
+                
+            if not os.path.exists(self.config.finetuned_predictor_path):
+                logger.error(f"最佳预测模型路径不存在: {self.config.finetuned_predictor_path}")
+                return False
             
-            # 这里实现预测逻辑
-            # 根据实际需求实现
+            logger.info(f"✓ 最佳分词模型路径: {self.config.finetuned_tokenizer_path}")
+            logger.info(f"✓ 最佳预测模型路径: {self.config.finetuned_predictor_path}")
+            logger.info(f"✓ 最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
+            logger.info(f"✓ 最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
             
-            logger.info("预测完成")
             return True
         except Exception as e:
+            logger.error(f"模型评估过程中出错: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
+    
+    def _evaluate_predictor_on_test_data(self, predictor_path, tokenizer_path):
+        """在测试数据上评估预测模型
+        
+        Args:
+            predictor_path: 预测模型路径
+            tokenizer_path: 分词模型路径
+            
+        Returns:
+            float: 测试损失
+        """
+        # 使用工具函数评估预测模型
+        return evaluate_predictor_on_test_data(predictor_path, tokenizer_path, self.test_data, self.config, self.device)
+    
+    def _evaluate_tokenizer_on_test_data(self, tokenizer_path):
+        """在测试数据上评估分词模型
+        
+        Args:
+            tokenizer_path: 分词模型路径
+            
+        Returns:
+            float: 测试损失
+        """
+        # 使用工具函数评估分词模型
+        return evaluate_tokenizer_on_test_data(tokenizer_path, self.test_data, self.config, self.device)
+    
+    def _evaluate_model_on_test_data(self, model, tokenizer, test_data):
+        """在测试数据上评估模型"""
+        # 使用工具函数评估模型
+        return evaluate_model_on_test_data(model, tokenizer, test_data, self.config, self.device)
+
+    def predict(self):
+        """使用训练好的模型进行预测未来10个工作日的股票走势"""
+        if not self.is_master:
+            return True
+            
+        logger.info("开始预测未来10个工作日的股票走势...")
+        try:
+            # 加载最佳模型
+            tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path, local_files_only=True)
+            tokenizer.eval().to(self.device)
+            
+            model = Kronos.from_pretrained(self.config.finetuned_predictor_path, local_files_only=True)
+            model.eval().to(self.device)
+            
+            # 加载最新的测试数据
+            test_data_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
+            logger.info(f"加载最新数据: {test_data_path}")
+            with open(test_data_path, 'rb') as f:
+                test_data = pickle.load(f)
+            
+            # 使用工具函数进行预测
+            save_dir = self.config.save_path
+            prediction_dfs = predict_future_trends(
+                tokenizer, model, test_data, self.config, 
+                self.device, save_dir
+            )
+            
+            return prediction_dfs is not None
+        except Exception as e:
             logger.error(f"预测时出错: {str(e)}")
+            # 已在文件顶部导入
+            logger.error(traceback.format_exc())
             return False
     
     def run_pipeline(self):
@@ -521,28 +750,48 @@ class KronosTrainingPipeline:
             if self.use_gpu and torch.cuda.device_count() > 1:
                 self.setup_distributed()
             
-            # 处理数据
+            # 处理数据并加载测试数据
             if not self.process_data():
                 logger.error("数据处理失败，流水线终止")
                 return False
             
-            # 训练分词模型
+            # 训练分词模型（每轮评估并保存最佳模型）
             if not self.train_tokenizer():
                 logger.error("分词模型训练失败，流水线终止")
                 return False
             
-            # 训练预测模型
+            # 训练预测模型（每轮评估并保存最佳模型）
             if not self.train_predictor():
                 logger.error("预测模型训练失败，流水线终止")
                 return False
             
-            # 进行预测
+            # 验证最佳模型是否已正确选择
+            if not self.evaluate_models():
+                logger.error("模型验证失败，流水线终止")
+                return False
+            
+            # 使用最佳模型进行预测
             if not self.predict():
                 logger.error("预测失败，流水线终止")
                 return False
             
             if self.is_master:
                 logger.info("完整训练流水线执行成功")
+                logger.info(f"最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
+                logger.info(f"最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
+                logger.info(f"最佳分词模型路径: {self.config.finetuned_tokenizer_path}")
+                logger.info(f"最佳预测模型路径: {self.config.finetuned_predictor_path}")
+                
+                # 更新历史最佳模型路径
+                success, tokenizer_path, predictor_path = update_best_model_paths(self.config)
+                if success:
+                    logger.info("已更新历史最佳模型路径")
+                    if tokenizer_path:
+                        logger.info(f"历史最佳分词模型路径: {tokenizer_path}")
+                    if predictor_path:
+                        logger.info(f"历史最佳预测模型路径: {predictor_path}")
+                else:
+                    logger.warning("更新历史最佳模型路径失败")
             
             # 清理分布式环境
             if self.use_gpu and torch.cuda.device_count() > 1:
@@ -551,7 +800,7 @@ class KronosTrainingPipeline:
             return True
         except Exception as e:
             logger.error(f"执行训练流水线时出错: {str(e)}")
-            import traceback
+            # 已在文件顶部导入
             logger.error(traceback.format_exc())
             
             # 清理分布式环境
@@ -582,6 +831,21 @@ def main():
         pass
 
     config.qlib_data_path = './qlib_bin'
+    config.data_source = args.data_source  # 添加数据来源到配置中
+    
+    # 设置总的时间范围为最近2年，测试集和验证集的范围为最近半年
+    current_date = datetime.now()
+    two_years_ago = (current_date - timedelta(days=365*2)).strftime('%Y-%m-%d')
+    six_months_ago = (current_date - timedelta(days=365/2)).strftime('%Y-%m-%d')
+    current_date_str = current_date.strftime('%Y-%m-%d')
+    
+    config.dataset_begin_time = two_years_ago
+    config.dataset_end_time = current_date_str
+    config.train_time_range = [two_years_ago, six_months_ago]
+    config.val_time_range = [six_months_ago, current_date_str]
+    config.test_time_range = [six_months_ago, current_date_str]
+    config.backtest_time_range = [six_months_ago, current_date_str]
+    
     config.batch_size = 4
     config.n_train_iter = 8
     config.n_val_iter = 4
@@ -589,9 +853,19 @@ def main():
     config.save_path = f"./outputs/{args.data_source}/models"
     config.pretrained_tokenizer_path = 'NeoQuasar/Kronos-Tokenizer-2k'
     config.pretrained_predictor_path = 'NeoQuasar/Kronos-mini'
+    config.tokenizer_save_folder_name = 'finetune_tokenizer'
+    config.predictor_save_folder_name = 'finetune_predictor'
+    config.backtest_save_folder_name = 'finetune_backtest'
     config.finetuned_tokenizer_path = f"{config.save_path}/{config.tokenizer_save_folder_name}/checkpoints/best_model"
     config.finetuned_predictor_path = f"{config.save_path}/{config.predictor_save_folder_name}/checkpoints/best_model"
     config.force_download_data = args.force_download
+
+    # 历史模型记录目录
+    config.model_history_dir = "./model_history"
+    # 历史最佳模型路径，用于存储历史上表现最好的模型
+    # 直接设置历史最佳模型路径为model_history_dir中的对应路径
+    config.his_best_tokenizer_path = os.path.join(config.model_history_dir, "best_tokenizer")
+    config.his_best_predictor_path = os.path.join(config.model_history_dir, "best_predictor")
 
     # 创建并运行流水线
     pipeline = KronosTrainingPipeline(
