@@ -1,3 +1,9 @@
+figures/qlib_bin.tar.gz
+finetune/data
+finetune/qlib_bin
+finetune/outputs
+
+
 # Python
 __pycache__/
 *.py[cod]
