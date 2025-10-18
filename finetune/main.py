@@ -80,12 +80,25 @@ class KronosTrainingPipeline:
         self.rank = 0
         self.world_size = 1
         self.local_rank = 0
-        self.device = torch.device("cuda:0" if use_gpu and torch.cuda.is_available() else "cpu")
+        # 支持 Mac M4 MPS 和 NVIDIA CUDA
+        if use_gpu:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda:0")
+                self.gpu_type = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+                self.gpu_type = "mps"
+            else:
+                self.device = torch.device("cpu")
+                self.gpu_type = "cpu"
+        else:
+            self.device = torch.device("cpu")
+            self.gpu_type = "cpu"
         self.is_master = True  # 单进程或主进程
         
         # 初始化日志
         setup_logging()
-        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, 数据源: {data_source}")
+        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}")
         
         # 设置保存路径，使用config中定义的路径
         self.tokenizer_save_dir = os.path.join(config.save_path, config.tokenizer_save_folder_name)
@@ -120,8 +133,11 @@ class KronosTrainingPipeline:
         
     def setup_distributed(self):
         """设置分布式训练环境"""
-        if not self.use_gpu:
-            logger.info("使用CPU训练，跳过分布式设置")
+        if not self.use_gpu or self.gpu_type == "mps":
+            if self.gpu_type == "mps":
+                logger.info("使用MPS训练，跳过分布式设置（MPS不支持分布式训练）")
+            else:
+                logger.info("使用CPU训练，跳过分布式设置")
             return
             
         try:
@@ -184,11 +200,11 @@ class KronosTrainingPipeline:
             return False
         
         # 设置DDP
-        if self.use_gpu and torch.cuda.device_count() > 1:
+        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
         
         # 创建数据加载器
-        if self.use_gpu and torch.cuda.device_count() > 1:
+        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
             train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_ddp(
                 self.config.__dict__, self.rank, self.world_size
             )
@@ -243,7 +259,7 @@ class KronosTrainingPipeline:
                     batch_x = ori_batch_x[start_idx:end_idx]
                     
                     # 前向传播
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         zs, bsq_loss, _, _ = model(batch_x)
                     else:
                         zs, bsq_loss, _, _ = model(batch_x)
@@ -261,7 +277,7 @@ class KronosTrainingPipeline:
                 
                 # 优化器步骤
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters() if not self.use_gpu or torch.cuda.device_count() <= 1 else model.module.parameters(), 
+                    model.parameters() if not self.use_gpu or self.gpu_type != "cuda" or torch.cuda.device_count() <= 1 else model.module.parameters(), 
                     max_norm=2.0
                 )
                 optimizer.step()
@@ -290,7 +306,7 @@ class KronosTrainingPipeline:
             with torch.no_grad():
                 for ori_batch_x, _ in val_loader:
                     ori_batch_x = ori_batch_x.squeeze(0).to(self.device)
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         zs, _, _, _ = model(ori_batch_x)
                     else:
                         zs, _, _, _ = model(ori_batch_x)
@@ -301,7 +317,7 @@ class KronosTrainingPipeline:
                     val_sample_count += ori_batch_x.size(0)
             
             # 如果是分布式训练，收集所有进程的验证损失
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 val_loss_sum_tensor = torch.tensor(tot_val_loss, device=self.device)
                 val_count_tensor = torch.tensor(val_sample_count, device=self.device)
                 dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
@@ -329,7 +345,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         model.module.save_pretrained(temp_save_path)
                     else:
                         model.save_pretrained(temp_save_path)
@@ -359,7 +375,7 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_tokenizer_path
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         model.module.save_pretrained(save_path)
                     else:
                         model.save_pretrained(save_path)
@@ -368,7 +384,7 @@ class KronosTrainingPipeline:
                         comet_logger.log_model("best_model", save_path)
             
             # 同步所有进程
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 dist.barrier()
         
         # 保存训练摘要
@@ -429,11 +445,11 @@ class KronosTrainingPipeline:
             return False
         
         # 设置DDP
-        if self.use_gpu and torch.cuda.device_count() > 1:
+        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
         
         # 创建数据加载器
-        if self.use_gpu and torch.cuda.device_count() > 1:
+        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
             train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_ddp(
                 self.config.__dict__, self.rank, self.world_size
             )
@@ -492,7 +508,7 @@ class KronosTrainingPipeline:
                 
                 # 前向传播和损失计算
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                if self.use_gpu and torch.cuda.device_count() > 1:
+                if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                     loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 else:
                     loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
@@ -501,7 +517,7 @@ class KronosTrainingPipeline:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters() if not self.use_gpu or torch.cuda.device_count() <= 1 else model.module.parameters(), 
+                    model.parameters() if not self.use_gpu or self.gpu_type != "cuda" or torch.cuda.device_count() <= 1 else model.module.parameters(), 
                     max_norm=3.0
                 )
                 optimizer.step()
@@ -538,7 +554,7 @@ class KronosTrainingPipeline:
                     token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
                     
                     logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         val_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     else:
                         val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
@@ -547,7 +563,7 @@ class KronosTrainingPipeline:
                     val_batches_processed += 1
             
             # 如果是分布式训练，收集所有进程的验证损失
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 val_loss_sum_tensor = torch.tensor(tot_val_loss, device=self.device)
                 val_batches_tensor = torch.tensor(val_batches_processed, device=self.device)
                 dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
@@ -575,7 +591,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         model.module.save_pretrained(temp_save_path)
                     else:
                         model.save_pretrained(temp_save_path)
@@ -605,7 +621,7 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_predictor_path
-                    if self.use_gpu and torch.cuda.device_count() > 1:
+                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                         model.module.save_pretrained(save_path)
                     else:
                         model.save_pretrained(save_path)
@@ -614,7 +630,7 @@ class KronosTrainingPipeline:
                         comet_logger.log_model("best_model", save_path)
             
             # 同步所有进程
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 dist.barrier()
         
         # 保存训练摘要
@@ -755,8 +771,8 @@ class KronosTrainingPipeline:
     def run_pipeline(self):
         """运行完整训练流水线"""
         try:
-            # 设置分布式环境（如果使用GPU）
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            # 设置分布式环境（如果使用CUDA多GPU）
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 self.setup_distributed()
             
             # 处理数据并加载测试数据
@@ -806,7 +822,7 @@ class KronosTrainingPipeline:
                     logger.warning("更新历史最佳模型路径失败")
             
             # 清理分布式环境
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 cleanup_ddp()
                 
             return True
@@ -816,7 +832,7 @@ class KronosTrainingPipeline:
             logger.error(traceback.format_exc())
             
             # 清理分布式环境
-            if self.use_gpu and torch.cuda.device_count() > 1:
+            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
                 cleanup_ddp()
                 
             return False
