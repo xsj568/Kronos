@@ -544,9 +544,17 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                         'current_amount': last_day_features['amount'][i],
                     }
                     
+                    # 获取未来日期
+                    last_date = timestamps[i]
+                    future_dates = get_future_business_days(last_date, config.predict_window)
+                    
                     # 添加未来每一天的所有特征预测
                     for day_idx in range(config.predict_window):
                         day_num = day_idx + 1
+                        
+                        # 保存预测日期
+                        pred_date = future_dates[day_idx].strftime('%Y-%m-%d') if day_idx < len(future_dates) else None
+                        detail_record[f'day_{day_num}_date'] = pred_date
                         
                         # 预测的所有特征值
                         for feat_name, feat_idx in feature_indices.items():
@@ -629,10 +637,18 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                         # 为每一天的每个特征添加列名映射
                         for day_idx in range(config.predict_window):
                             day_num = day_idx + 1
+                            # 获取对应的预测日期
+                            pred_date = detailed_df[f'day_{day_num}_date'].iloc[0] if f'day_{day_num}_date' in detailed_df.columns else None
+                            date_str = f'({pred_date})' if pred_date else ''
+                            
+                            # 添加日期列映射
+                            if f'day_{day_num}_date' in detailed_df.columns:
+                                column_mapping[f'day_{day_num}_date'] = f'第{day_num}天日期'
+                            
                             for feat_key, feat_name in feature_name_map.items():
-                                column_mapping[f'day_{day_num}_{feat_key}'] = f'第{day_num}天预测{feat_name}'
-                                column_mapping[f'day_{day_num}_{feat_key}_change'] = f'第{day_num}天{feat_name}变化'
-                                column_mapping[f'day_{day_num}_{feat_key}_change_pct'] = f'第{day_num}天{feat_name}涨跌幅(%)'
+                                column_mapping[f'day_{day_num}_{feat_key}'] = f'第{day_num}天{date_str}预测{feat_name}'
+                                column_mapping[f'day_{day_num}_{feat_key}_change'] = f'第{day_num}天{date_str}{feat_name}变化'
+                                column_mapping[f'day_{day_num}_{feat_key}_change_pct'] = f'第{day_num}天{date_str}{feat_name}涨跌幅(%)'
                         
                         # 创建显示用的DataFrame
                         display_df = detailed_df.copy()
@@ -708,13 +724,27 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                     if 'detailed' in prediction_dfs and len(detailed_df) > 0:
                         # 收盘价涨跌幅排行榜（第N天）
                         if f'day_{config.predict_window}_close_change_pct' in detailed_df.columns:
-                            ranking_df = detailed_df[['stock_code', 'current_close', 
-                                                       f'day_{config.predict_window}_close', 
-                                                       f'day_{config.predict_window}_close_change_pct']].copy()
+                            cols_to_select = ['stock_code', 'current_close', 
+                                          f'day_{config.predict_window}_close', 
+                                          f'day_{config.predict_window}_close_change_pct']
+                            
+                            # 如果有日期列，也加入选择
+                            if f'day_{config.predict_window}_date' in detailed_df.columns:
+                                cols_to_select.append(f'day_{config.predict_window}_date')
+                                
+                            ranking_df = detailed_df[cols_to_select].copy()
                             ranking_df = ranking_df.sort_values(f'day_{config.predict_window}_close_change_pct', ascending=False)
                         
+                        # 获取预测日期
+                        pred_date = ranking_df[f'day_{config.predict_window}_date'].iloc[0] if f'day_{config.predict_window}_date' in ranking_df.columns else None
+                        date_str = f'({pred_date})' if pred_date else ''
+                        
                         # 重命名列
-                        ranking_df.columns = ['股票代码', '当前收盘价', f'第{config.predict_window}天预测价格', f'第{config.predict_window}天涨跌幅(%)']
+                        col_names = ['股票代码', '当前收盘价', f'第{config.predict_window}天{date_str}预测价格', f'第{config.predict_window}天{date_str}涨跌幅(%)']
+                        if f'day_{config.predict_window}_date' in ranking_df.columns:
+                            ranking_df = ranking_df.drop(columns=[f'day_{config.predict_window}_date'])
+                            
+                        ranking_df.columns = col_names
                         
                         # 添加排名
                         ranking_df.insert(0, '排名', range(1, len(ranking_df) + 1))
@@ -724,7 +754,10 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                         
                         # 美化排行榜
                         worksheet = writer.sheets['涨跌幅排行榜']
-                        worksheet['A1'] = f'股票涨跌幅排行榜 (第{config.predict_window}天预测)'
+                        # 获取预测日期
+                        pred_date = detailed_df[f'day_{config.predict_window}_date'].iloc[0] if f'day_{config.predict_window}_date' in detailed_df.columns else None
+                        date_str = f' {pred_date} ' if pred_date else ' '
+                        worksheet['A1'] = f'股票涨跌幅排行榜 (第{config.predict_window}天{date_str}预测)'
                         worksheet['A1'].font = Font(size=14, bold=True, color='FFFFFF')
                         worksheet['A1'].fill = PatternFill(start_color='70AD47', end_color='70AD47', fill_type='solid')
                         worksheet.merge_cells(f'A1:{get_column_letter(len(ranking_df.columns))}1')
@@ -795,8 +828,15 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                                 }
                                 for day_idx in range(config.predict_window):
                                     day_num = day_idx + 1
-                                    col_rename[f'day_{day_num}_{feat_key}'] = f'第{day_num}天{feat_name}'
-                                    col_rename[f'day_{day_num}_{feat_key}_change_pct'] = f'第{day_num}天涨跌幅(%)'
+                                    # 获取对应的预测日期
+                                    pred_date = detailed_df[f'day_{day_num}_date'].iloc[0] if f'day_{day_num}_date' in detailed_df.columns else None
+                                    date_str = f'({pred_date})' if pred_date else ''
+                                    
+                                    col_rename[f'day_{day_num}_{feat_key}'] = f'第{day_num}天{date_str}{feat_name}'
+                                    col_rename[f'day_{day_num}_{feat_key}_change_pct'] = f'第{day_num}天{date_str}涨跌幅(%)'
+                                    # 如果有日期列也添加到列名映射中
+                                    if f'day_{day_num}_date' in detailed_df.columns and f'day_{day_num}_date' in feat_df.columns:
+                                        col_rename[f'day_{day_num}_date'] = f'第{day_num}天日期'
                                 
                                 feat_df = feat_df.rename(columns=col_rename)
                                 

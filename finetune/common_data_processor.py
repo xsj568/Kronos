@@ -122,9 +122,99 @@ class SinaDataProcessor(BaseDataProcessor):
         """初始化新浪数据处理器"""
         super().__init__(config)
         self.url_base = "http://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=%s&___qn=3n"
-        self.symbols = self.config.sina_symbols if hasattr(self.config, 'sina_symbols') else ['AAPL', 'MSFT', 'GOOG']
+        
+        # 加载股票代码列表
+        self.symbols = self._load_symbols_from_csv()
+        logger.info(f"使用{len(self.symbols)}支股票进行训练: {self.symbols[:5]}... 等")
+        
         self.data_fields = ['open', 'close', 'high', 'low', 'volume']
         self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
+    
+    def _load_symbols_from_csv(self):
+        """
+        从stock_code_US.csv文件中加载股票代码列表
+        
+        Returns:
+            list: 股票代码列表
+        """
+        csv_path = Path(__file__).parent / "stock_code_US.csv"
+        
+        if not csv_path.exists():
+            logger.warning(f"CSV文件不存在: {csv_path}，使用默认股票代码列表")
+            return self._get_default_symbols()
+        
+        try:
+            # 读取CSV文件
+            df = pd.read_csv(csv_path)
+            
+            # 检查必要的列是否存在
+            if 'symbol' not in df.columns:
+                logger.error("CSV文件中缺少'symbol'列")
+                return self._get_default_symbols()
+            
+            # 获取配置中的过滤条件
+            filters = getattr(self.config, 'sina_symbol_filters', {})
+            
+            # 应用过滤条件
+            filtered_df = df.copy()
+
+            # 限制股票数量
+            max_symbols = getattr(self.config, 'max_sina_symbols', None)
+            if max_symbols and len(filtered_df) > max_symbols:
+                # 随机选择指定数量的股票
+                filtered_df = filtered_df.sample(n=max_symbols, random_state=42)
+                logger.info(f"随机选择 {max_symbols} 支股票")
+            
+            # 提取股票代码
+            symbols = filtered_df['symbol'].dropna().tolist()
+            
+            # 过滤掉无效的股票代码
+            symbols = [s for s in symbols if isinstance(s, str) and len(s) > 0 and not s.startswith('-')]
+            
+            if not symbols:
+                logger.warning("过滤后没有有效的股票代码，使用默认列表")
+                return self._get_default_symbols()
+            
+            logger.info(f"从CSV文件加载了 {len(symbols)} 支股票代码")
+            return symbols
+            
+        except Exception as e:
+            logger.error(f"读取CSV文件失败: {str(e)}，使用默认股票代码列表")
+            return self._get_default_symbols()
+    
+    def _get_default_symbols(self):
+        """
+        获取默认的股票代码列表
+        
+        Returns:
+            list: 默认股票代码列表
+        """
+        default_symbols = [
+            # 科技股
+            'AAPL', 'MSFT', 'GOOG', 'GOOGL', 'AMZN', 'META', 'TSLA', 'NVDA', 'INTC', 'AMD', 
+            # 金融股
+            'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'V', 'MA', 'AXP', 'BLK',
+            # 医疗保健
+            'JNJ', 'PFE', 'MRK', 'ABBV', 'UNH', 'CVS', 'ABT', 'LLY', 'AMGN', 'BMY',
+            # 消费品
+            'PG', 'KO', 'PEP', 'WMT', 'MCD', 'SBUX', 'NKE', 'DIS', 'HD', 'LOW',
+            # 能源
+            'XOM', 'CVX', 'COP', 'SLB', 'EOG', 'MPC', 'PSX', 'VLO', 'OXY', 'BP',
+            # 工业
+            'GE', 'HON', 'MMM', 'CAT', 'DE', 'BA', 'LMT', 'RTX', 'UPS', 'FDX',
+            # 电信
+            'T', 'VZ', 'TMUS', 'CMCSA', 'NFLX', 'CHTR', 'DISH', 'LUMN', 'ATVI', 'EA',
+            # 半导体
+            'TSM', 'AVGO', 'QCOM', 'TXN', 'MU', 'AMAT', 'KLAC', 'LRCX', 'ADI', 'MCHP',
+            # 中国股票
+            'BABA', 'JD', 'PDD', 'BIDU', 'NIO', 'LI', 'XPEV', 'TME', 'BILI', 'NTES'
+        ]
+        
+        # 如果配置中指定了sina_symbols，则使用配置中的列表
+        if hasattr(self.config, 'sina_symbols') and self.config.sina_symbols:
+            return self.config.sina_symbols
+        
+        return default_symbols
     
     def http_get(self, url, params=None, headers=None, retry=3, timeout=10):
         """HTTP GET请求，支持重试"""
@@ -186,7 +276,7 @@ class SinaDataProcessor(BaseDataProcessor):
         # 创建DataFrame
         dates_pd = pd.to_datetime(dates)
         df = pd.DataFrame({
-            'date': dates,
+            'datetime': dates_pd,  # Use 'datetime' instead of 'date'
             'open': opens,
             'close': closes,
             'high': highs,
@@ -195,7 +285,7 @@ class SinaDataProcessor(BaseDataProcessor):
         }, index=dates_pd)
         
         # 转换日期为整数格式
-        df['date'] = df['date'].apply(lambda x: int(x.replace('-', '')))
+        df['date'] = df['datetime'].dt.strftime('%Y%m%d').astype(int)
         
         # 计算额外特征
         df['vol'] = df['volume']  # 与Qlib保持一致

@@ -814,9 +814,11 @@ def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='Kronos模型训练流水线')
     parser.add_argument('--cpu', action='store_true', default=False, help='使用CPU训练')
-    parser.add_argument('--data-source', type=str, default='qlib', choices=['qlib', 'sina'], help='数据源类型')
+    parser.add_argument('--data-source', type=str, default='sina', choices=['qlib', 'sina'], help='数据源类型')
     parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
     parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')
+    parser.add_argument('--model-version', type=str, default='mini', choices=['mini', 'small', 'base'], 
+                        help='模型版本: mini(小), small(中), base(大)')
     return parser.parse_args()
 
 
@@ -850,22 +852,49 @@ def main():
     config.n_train_iter = 8
     config.n_val_iter = 4
     config.use_comet = False
-    config.save_path = f"./outputs/{args.data_source}/models"
-    config.pretrained_tokenizer_path = 'NeoQuasar/Kronos-Tokenizer-2k'
-    config.pretrained_predictor_path = 'NeoQuasar/Kronos-mini'
+    config.max_sina_symbols = 100
+    
+    # 根据选择的模型版本设置预训练模型路径
+    model_versions = {
+        'mini': {
+            'tokenizer': 'NeoQuasar/Kronos-Tokenizer-2k',
+            'predictor': 'NeoQuasar/Kronos-mini'
+        },
+        'small': {
+            'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
+            'predictor': 'NeoQuasar/Kronos-small'
+        },
+        'base': {
+            'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
+            'predictor': 'NeoQuasar/Kronos-base'
+        }
+    }
+    
+    # 使用选择的模型版本
+    model_version = args.model_version
+    logger.info(f"使用模型版本: {model_version}")
+    
+    config.save_path = f"./outputs/{args.data_source}/{model_version}"
+    config.pretrained_tokenizer_path = model_versions[model_version]['tokenizer']
+    config.pretrained_predictor_path = model_versions[model_version]['predictor']
     config.tokenizer_save_folder_name = 'finetune_tokenizer'
     config.predictor_save_folder_name = 'finetune_predictor'
     config.backtest_save_folder_name = 'finetune_backtest'
-    config.finetuned_tokenizer_path = f"{config.save_path}/{config.tokenizer_save_folder_name}/checkpoints/best_model"
-    config.finetuned_predictor_path = f"{config.save_path}/{config.predictor_save_folder_name}/checkpoints/best_model"
+    config.finetuned_tokenizer_path = f"{config.save_path}/{config.tokenizer_save_folder_name}/best_model"
+    config.finetuned_predictor_path = f"{config.save_path}/{config.predictor_save_folder_name}/best_model"
     config.force_download_data = args.force_download
 
     # 历史模型记录目录
     config.model_history_dir = "./model_history"
     # 历史最佳模型路径，用于存储历史上表现最好的模型
-    # 直接设置历史最佳模型路径为model_history_dir中的对应路径
-    config.his_best_tokenizer_path = os.path.join(config.model_history_dir, "best_tokenizer")
-    config.his_best_predictor_path = os.path.join(config.model_history_dir, "best_predictor")
+    # 包含数据类型和模型版本号
+    history_subdir = f"{args.data_source}/{model_version}"
+    model_history_subdir = os.path.join(config.model_history_dir, history_subdir)
+    os.makedirs(model_history_subdir, exist_ok=True)
+    
+    # 设置历史最佳模型路径
+    config.his_best_tokenizer_path = os.path.join(model_history_subdir, "best_tokenizer")
+    config.his_best_predictor_path = os.path.join(model_history_subdir, "best_predictor")
 
     # 创建并运行流水线
     pipeline = KronosTrainingPipeline(
