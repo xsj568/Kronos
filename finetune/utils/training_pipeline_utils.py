@@ -1508,10 +1508,9 @@ def compare_and_select_best_model(model_type, config, test_data, device, history
                 }
             
             # 当前训练模型
-            current_model_path = os.path.join(config.save_path, config.tokenizer_save_folder_name, 'checkpoints/best_model')
-            if os.path.exists(current_model_path):
+            if os.path.exists(config.finetuned_tokenizer_path):
                 models_to_compare['current'] = {
-                    'path': current_model_path,
+                    'path': config.finetuned_tokenizer_path,
                     'is_remote': False  # 当前模型从本地加载
                 }
                 
@@ -1555,10 +1554,9 @@ def compare_and_select_best_model(model_type, config, test_data, device, history
                 }
             
             # 当前训练模型
-            current_model_path = os.path.join(config.save_path, config.predictor_save_folder_name, 'checkpoints/best_model')
-            if os.path.exists(current_model_path):
+            if os.path.exists(config.finetuned_predictor_path):
                 models_to_compare['current'] = {
-                    'path': current_model_path,
+                    'path': config.finetuned_predictor_path,
                     'is_remote': False  # 当前模型从本地加载
                 }
                 
@@ -1739,12 +1737,18 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
                 
                 # 如果找到了最佳模型，复制到指定路径
                 if best_model_path:
+                    # 复制到当前训练的最佳模型路径
                     os.makedirs(save_path, exist_ok=True)
                     os.system(f"cp -r {best_model_path}/* {save_path}/")
                     logger.info(f"最佳分词模型已复制到 {save_path}")
                     
-                    # 更新配置中的最佳模型路径
-                    config.his_best_tokenizer_path = best_model_path
+                    # 同时复制到历史最佳模型路径
+                    if hasattr(config, 'his_best_tokenizer_path') and config.his_best_tokenizer_path:
+                        os.makedirs(config.his_best_tokenizer_path, exist_ok=True)
+                        os.system(f"cp -r {best_model_path}/* {config.his_best_tokenizer_path}/")
+                        logger.info(f"最佳分词模型已复制到历史路径 {config.his_best_tokenizer_path}")
+                    
+                    # 注意：不需要更新config.his_best_tokenizer_path，它应该保持为历史模型目录路径
             
             else:  # predictor
                 tokenizer_path = config.finetuned_tokenizer_path
@@ -1811,12 +1815,18 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
                 
                 # 如果找到了最佳模型，复制到指定路径
                 if best_model_path:
+                    # 复制到当前训练的最佳模型路径
                     os.makedirs(save_path, exist_ok=True)
                     os.system(f"cp -r {best_model_path}/* {save_path}/")
                     logger.info(f"最佳预测模型已复制到 {save_path}")
                     
-                    # 更新配置中的最佳模型路径
-                    config.his_best_predictor_path = best_model_path
+                    # 同时复制到历史最佳模型路径
+                    if hasattr(config, 'his_best_predictor_path') and config.his_best_predictor_path:
+                        os.makedirs(config.his_best_predictor_path, exist_ok=True)
+                        os.system(f"cp -r {best_model_path}/* {config.his_best_predictor_path}/")
+                        logger.info(f"最佳预测模型已复制到历史路径 {config.his_best_predictor_path}")
+                    
+                    # 注意：不需要更新config.his_best_predictor_path，它应该保持为历史模型目录路径
         
         # 后续epoch只评估当前模型
         else:
@@ -1844,20 +1854,30 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
             # 如果当前模型更好，则更新最佳模型
             if current_test_loss < best_loss:
                 best_loss = current_test_loss
+                
+                # 复制到当前训练的最佳模型路径
                 os.makedirs(save_path, exist_ok=True)
                 os.system(f"cp -r {current_model_path}/* {save_path}/")
                 logger.info(f"当前{model_type}模型是新的最佳模型，已保存到 {save_path}")
                 
+                # 同时复制到历史最佳模型路径
+                if model_type == 'tokenizer':
+                    if hasattr(config, 'his_best_tokenizer_path') and config.his_best_tokenizer_path:
+                        os.makedirs(config.his_best_tokenizer_path, exist_ok=True)
+                        os.system(f"cp -r {current_model_path}/* {config.his_best_tokenizer_path}/")
+                        logger.info(f"最佳分词模型已复制到历史路径 {config.his_best_tokenizer_path}")
+                else:
+                    if hasattr(config, 'his_best_predictor_path') and config.his_best_predictor_path:
+                        os.makedirs(config.his_best_predictor_path, exist_ok=True)
+                        os.system(f"cp -r {current_model_path}/* {config.his_best_predictor_path}/")
+                        logger.info(f"最佳预测模型已复制到历史路径 {config.his_best_predictor_path}")
+                
                 # 更新评估信息
                 eval_info['best_loss'] = best_loss
                 eval_info['best_model_name'] = current_model_name
-                eval_info['best_model_path'] = current_model_path
+                eval_info['best_model_path'] = save_path
                 
-                # 更新配置中的最佳模型路径
-                if model_type == 'tokenizer':
-                    config.his_best_tokenizer_path = current_model_path
-                else:
-                    config.his_best_predictor_path = current_model_path
+                # 注意：不需要更新config.his_best_*_path，它们应该保持为历史模型目录路径
             else:
                 logger.info(f"当前{model_type}模型未能超过历史最佳模型，保持原有最佳模型")
         

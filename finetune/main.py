@@ -7,6 +7,7 @@ Kronos 金融模型完整训练流程
 """
 
 import os
+import shutil
 import sys
 import json
 import time
@@ -86,11 +87,15 @@ class KronosTrainingPipeline:
         setup_logging()
         logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, 数据源: {data_source}")
         
-        # 设置保存路径
+        # 设置保存路径，使用config中定义的路径
         self.tokenizer_save_dir = os.path.join(config.save_path, config.tokenizer_save_folder_name)
         self.predictor_save_dir = os.path.join(config.save_path, config.predictor_save_folder_name)
-        os.makedirs(os.path.join(self.tokenizer_save_dir, 'checkpoints'), exist_ok=True)
-        os.makedirs(os.path.join(self.predictor_save_dir, 'checkpoints'), exist_ok=True)
+        
+        # 确保检查点目录存在
+        tokenizer_checkpoint_dir = os.path.dirname(config.finetuned_tokenizer_path)
+        predictor_checkpoint_dir = os.path.dirname(config.finetuned_predictor_path)
+        os.makedirs(tokenizer_checkpoint_dir, exist_ok=True)
+        os.makedirs(predictor_checkpoint_dir, exist_ok=True)
         
         # 保存流水线配置
         save_pipeline_config(config, config.save_path)
@@ -317,18 +322,19 @@ class KronosTrainingPipeline:
                 if comet_logger:
                     comet_logger.log_metric('val_tokenizer_loss_epoch', avg_val_loss, epoch=epoch_idx)
                 
-                # 保存当前模型到临时路径
-                temp_save_path = f"{self.tokenizer_save_dir}/checkpoints/epoch_{epoch_idx + 1}"
-                os.makedirs(temp_save_path, exist_ok=True)
-                if self.use_gpu and torch.cuda.device_count() > 1:
-                    model.module.save_pretrained(temp_save_path)
-                else:
-                    model.save_pretrained(temp_save_path)
-                
                 # 在测试集上评估当前模型
                 if hasattr(self, 'test_data') and self.test_data is not None:
-                    # 使用工具函数评估模型
-                    best_path = f"{self.tokenizer_save_dir}/checkpoints/best_model"
+                    # 创建临时路径用于当前模型评估，包含epoch信息
+                    temp_save_path = f"{self.tokenizer_save_dir}/checkpoints/current_model_epoch_{epoch_idx + 1}"
+                    os.makedirs(temp_save_path, exist_ok=True)
+                    
+                    # 保存当前模型到临时路径用于评估
+                    if self.use_gpu and torch.cuda.device_count() > 1:
+                        model.module.save_pretrained(temp_save_path)
+                    else:
+                        model.save_pretrained(temp_save_path)
+                    
+                    # 使用工具函数评估模型，使用config中定义的路径
                     self.best_tokenizer_test_loss, eval_info = evaluate_models_during_training(
                         epoch_idx=epoch_idx,
                         current_model_path=temp_save_path,
@@ -337,19 +343,22 @@ class KronosTrainingPipeline:
                         device=self.device,
                         model_type='tokenizer',
                         best_loss=self.best_tokenizer_test_loss,
-                        save_path=best_path
+                        save_path=self.config.finetuned_tokenizer_path
                     )
+                    
+                    # 清理临时模型文件
+                    #shutil.rmtree(temp_save_path, ignore_errors=True)
                     # 记录评估信息
                     evaluation_history.append(eval_info)
                     
                     # 记录到Comet（如果启用）
-                    if comet_logger and os.path.exists(best_path):
-                        comet_logger.log_model("best_model", best_path)
+                    if comet_logger and os.path.exists(self.config.finetuned_tokenizer_path):
+                        comet_logger.log_model("best_model", self.config.finetuned_tokenizer_path)
                 
                 # 如果没有测试数据，则使用验证损失作为标准
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
-                    save_path = f"{self.tokenizer_save_dir}/checkpoints/best_model"
+                    save_path = self.config.finetuned_tokenizer_path
                     if self.use_gpu and torch.cuda.device_count() > 1:
                         model.module.save_pretrained(save_path)
                     else:
@@ -389,14 +398,12 @@ class KronosTrainingPipeline:
             }
             save_training_summary(self.tokenizer_save_dir, summary)
             
-            # 更新配置中的最佳分词模型路径，供后续训练预测模型使用
-            best_model_path = f"{self.tokenizer_save_dir}/checkpoints/best_model"
-            if os.path.exists(best_model_path):
-                self.config.finetuned_tokenizer_path = best_model_path
-                logger.info(f"分词模型训练完成，最佳模型路径已更新: {best_model_path}")
+            # 检查分词模型训练结果
+            if os.path.exists(self.config.finetuned_tokenizer_path):
+                logger.info(f"分词模型训练完成，最佳模型路径: {self.config.finetuned_tokenizer_path}")
                 logger.info(f"最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
             else:
-                logger.warning(f"最佳模型路径不存在: {best_model_path}")
+                logger.warning(f"最佳模型路径不存在: {self.config.finetuned_tokenizer_path}")
             
             if comet_logger:
                 comet_logger.end()
@@ -561,18 +568,19 @@ class KronosTrainingPipeline:
                 if comet_logger:
                     comet_logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
                 
-                # 保存当前模型到临时路径
-                temp_save_path = f"{self.predictor_save_dir}/checkpoints/epoch_{epoch_idx + 1}"
-                os.makedirs(temp_save_path, exist_ok=True)
-                if self.use_gpu and torch.cuda.device_count() > 1:
-                    model.module.save_pretrained(temp_save_path)
-                else:
-                    model.save_pretrained(temp_save_path)
-                
                 # 在测试集上评估当前模型
                 if hasattr(self, 'test_data') and self.test_data is not None:
-                    # 使用工具函数评估模型
-                    best_path = f"{self.predictor_save_dir}/checkpoints/best_model"
+                    # 创建临时路径用于当前模型评估，包含epoch信息
+                    temp_save_path = f"{self.predictor_save_dir}/checkpoints/current_model_epoch_{epoch_idx + 1}"
+                    os.makedirs(temp_save_path, exist_ok=True)
+                    
+                    # 保存当前模型到临时路径用于评估
+                    if self.use_gpu and torch.cuda.device_count() > 1:
+                        model.module.save_pretrained(temp_save_path)
+                    else:
+                        model.save_pretrained(temp_save_path)
+                    
+                    # 使用工具函数评估模型，使用config中定义的路径
                     self.best_predictor_test_loss, eval_info = evaluate_models_during_training(
                         epoch_idx=epoch_idx,
                         current_model_path=temp_save_path,
@@ -581,19 +589,22 @@ class KronosTrainingPipeline:
                         device=self.device,
                         model_type='predictor',
                         best_loss=self.best_predictor_test_loss,
-                        save_path=best_path
+                        save_path=self.config.finetuned_predictor_path
                     )
+                    
+                    # 清理临时模型文件
+                    #shutil.rmtree(temp_save_path, ignore_errors=True)
                     # 记录评估信息
                     evaluation_history.append(eval_info)
                     
                     # 记录到Comet（如果启用）
-                    if comet_logger and os.path.exists(best_path):
-                        comet_logger.log_model("best_model", best_path)
+                    if comet_logger and os.path.exists(self.config.finetuned_predictor_path):
+                        comet_logger.log_model("best_model", self.config.finetuned_predictor_path)
                 
                 # 如果没有测试数据，则使用验证损失作为标准
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
-                    save_path = f"{self.predictor_save_dir}/checkpoints/best_model"
+                    save_path = self.config.finetuned_predictor_path
                     if self.use_gpu and torch.cuda.device_count() > 1:
                         model.module.save_pretrained(save_path)
                     else:
@@ -633,14 +644,12 @@ class KronosTrainingPipeline:
             }
             save_training_summary(self.predictor_save_dir, summary)
             
-            # 更新配置中的最佳预测模型路径，供后续预测使用
-            best_model_path = f"{self.predictor_save_dir}/checkpoints/best_model"
-            if os.path.exists(best_model_path):
-                self.config.finetuned_predictor_path = best_model_path
-                logger.info(f"预测模型训练完成，最佳模型路径已更新: {best_model_path}")
+            # 检查预测模型训练结果
+            if os.path.exists(self.config.finetuned_predictor_path):
+                logger.info(f"预测模型训练完成，最佳模型路径: {self.config.finetuned_predictor_path}")
                 logger.info(f"最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
             else:
-                logger.warning(f"最佳模型路径不存在: {best_model_path}")
+                logger.warning(f"最佳模型路径不存在: {self.config.finetuned_predictor_path}")
             
             if comet_logger:
                 comet_logger.end()
@@ -783,7 +792,10 @@ class KronosTrainingPipeline:
                 logger.info(f"最佳预测模型路径: {self.config.finetuned_predictor_path}")
                 
                 # 更新历史最佳模型路径
-                success, tokenizer_path, predictor_path = update_best_model_paths(self.config)
+                # 使用正确的model_history_subdir路径
+                model_version = getattr(self.config, 'model_version', 'default')
+                model_history_subdir = os.path.join(self.config.model_history_dir, f"{self.data_source}/{model_version}")
+                success, tokenizer_path, predictor_path = update_best_model_paths(self.config, model_history_subdir)
                 if success:
                     logger.info("已更新历史最佳模型路径")
                     if tokenizer_path:
@@ -852,7 +864,7 @@ def main():
     config.n_train_iter = 8
     config.n_val_iter = 4
     config.use_comet = False
-    config.max_sina_symbols = 100
+    config.max_sina_symbols = 10
     
     # 根据选择的模型版本设置预训练模型路径
     model_versions = {
@@ -869,10 +881,13 @@ def main():
             'predictor': 'NeoQuasar/Kronos-base'
         }
     }
-    
+    config.force_download_data = args.force_download
     # 使用选择的模型版本
     model_version = args.model_version
     logger.info(f"使用模型版本: {model_version}")
+    
+    # 保存模型版本信息，供训练流水线使用
+    config.model_version = model_version
     
     config.save_path = f"./outputs/{args.data_source}/{model_version}"
     config.pretrained_tokenizer_path = model_versions[model_version]['tokenizer']
@@ -880,9 +895,9 @@ def main():
     config.tokenizer_save_folder_name = 'finetune_tokenizer'
     config.predictor_save_folder_name = 'finetune_predictor'
     config.backtest_save_folder_name = 'finetune_backtest'
+    # 保存训练过程中在测试集上评估过的最好模型，实时更新，每个epoch如果有最好的模型则需要更新
     config.finetuned_tokenizer_path = f"{config.save_path}/{config.tokenizer_save_folder_name}/best_model"
     config.finetuned_predictor_path = f"{config.save_path}/{config.predictor_save_folder_name}/best_model"
-    config.force_download_data = args.force_download
 
     # 历史模型记录目录
     config.model_history_dir = "./model_history"
@@ -892,7 +907,7 @@ def main():
     model_history_subdir = os.path.join(config.model_history_dir, history_subdir)
     os.makedirs(model_history_subdir, exist_ok=True)
     
-    # 设置历史最佳模型路径
+    # 历史最好的模型记录，当前训练完成后需要把最好的模型更新到该文件夹中去，所有epoch训练完成后需要更新
     config.his_best_tokenizer_path = os.path.join(model_history_subdir, "best_tokenizer")
     config.his_best_predictor_path = os.path.join(model_history_subdir, "best_predictor")
 
