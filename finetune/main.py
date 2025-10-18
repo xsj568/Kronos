@@ -829,7 +829,7 @@ def parse_args():
     parser.add_argument('--data-source', type=str, default='sina', choices=['qlib', 'sina'], help='数据源类型')
     parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
     parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')
-    parser.add_argument('--model-version', type=str, default='mini', choices=['mini', 'small', 'base'], 
+    parser.add_argument('--model-version', type=str, default='base', choices=['mini', 'small', 'base'],
                         help='模型版本: mini(小), small(中), base(大)')
     return parser.parse_args()
 
@@ -859,12 +859,13 @@ def main():
     config.val_time_range = [six_months_ago, current_date_str]
     config.test_time_range = [six_months_ago, current_date_str]
     config.backtest_time_range = [six_months_ago, current_date_str]
-    
-    config.batch_size = 4
-    config.n_train_iter = 8
-    config.n_val_iter = 4
+
+    config.epochs = 8
+    config.batch_size = 50
+    config.n_train_iter = 80000
+    config.n_val_iter = 40
     config.use_comet = False
-    config.max_sina_symbols = 10
+    config.max_sina_symbols = 100
     
     # 根据选择的模型版本设置预训练模型路径
     model_versions = {

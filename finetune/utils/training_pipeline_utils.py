@@ -103,9 +103,9 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs'):
             else:
                 return dt.strftime('%Y-%m-%d %H:%M:%S')
     
-    # 创建格式化器
+    # 创建格式化器，包含函数名信息
     formatter = ShanghaiFormatter(
-        fmt='%(asctime)s | %(levelname)-8s | %(filename)s:%(lineno)d | %(message)s',
+        fmt='%(asctime)s | %(levelname)-8s | %(filename)s:%(lineno)d | %(funcName)s() | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -123,7 +123,7 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs'):
     root_logger.addHandler(console_handler)
     
     # 添加文件处理器
-    file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
+    file_handler = logging.FileHandler(log_filepath, mode='a', encoding='utf-8')
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
