@@ -1220,8 +1220,12 @@ def evaluate_and_select_best_model(model_type, model_paths, test_data, config, d
                 if save_path:
                     # 复制模型到最终路径
                     logger.info(f"将 {model_name} 模型复制为最佳模型")
-                    os.makedirs(save_path, exist_ok=True)
-                    os.system(f"cp -r {model_path}/* {save_path}/")
+                    # 检查源路径和目标路径是否相同，避免复制到相同位置
+                    if os.path.abspath(model_path) != os.path.abspath(save_path):
+                        os.makedirs(save_path, exist_ok=True)
+                        os.system(f"cp -r {model_path}/* {save_path}/")
+                    else:
+                        logger.info(f"模型源路径与目标路径相同，跳过复制: {model_path}")
         
         logger.info(f"模型评估完成，最佳模型: {best_model_name}，测试损失: {best_val_loss:.4f}")
         return best_model_name, best_model_path, best_val_loss
@@ -1738,15 +1742,23 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
                 # 如果找到了最佳模型，复制到指定路径
                 if best_model_path:
                     # 复制到当前训练的最佳模型路径
-                    os.makedirs(save_path, exist_ok=True)
-                    os.system(f"cp -r {best_model_path}/* {save_path}/")
-                    logger.info(f"最佳分词模型已复制到 {save_path}")
+                    # 检查源路径和目标路径是否相同，避免复制到相同位置
+                    if os.path.abspath(best_model_path) != os.path.abspath(save_path):
+                        os.makedirs(save_path, exist_ok=True)
+                        os.system(f"cp -r {best_model_path}/* {save_path}/")
+                        logger.info(f"最佳分词模型已复制到 {save_path}")
+                    else:
+                        logger.info(f"最佳分词模型源路径与目标路径相同，跳过复制: {best_model_path}")
                     
                     # 同时复制到历史最佳模型路径
                     if hasattr(config, 'his_best_tokenizer_path') and config.his_best_tokenizer_path:
-                        os.makedirs(config.his_best_tokenizer_path, exist_ok=True)
-                        os.system(f"cp -r {best_model_path}/* {config.his_best_tokenizer_path}/")
-                        logger.info(f"最佳分词模型已复制到历史路径 {config.his_best_tokenizer_path}")
+                        # 检查源路径和目标路径是否相同，避免复制到相同位置
+                        if os.path.abspath(best_model_path) != os.path.abspath(config.his_best_tokenizer_path):
+                            os.makedirs(config.his_best_tokenizer_path, exist_ok=True)
+                            os.system(f"cp -r {best_model_path}/* {config.his_best_tokenizer_path}/")
+                            logger.info(f"最佳分词模型已复制到历史路径 {config.his_best_tokenizer_path}")
+                        else:
+                            logger.info(f"最佳分词模型路径与历史路径相同，跳过复制: {config.his_best_tokenizer_path}")
                     
                     # 注意：不需要更新config.his_best_tokenizer_path，它应该保持为历史模型目录路径
             
@@ -1816,15 +1828,23 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
                 # 如果找到了最佳模型，复制到指定路径
                 if best_model_path:
                     # 复制到当前训练的最佳模型路径
-                    os.makedirs(save_path, exist_ok=True)
-                    os.system(f"cp -r {best_model_path}/* {save_path}/")
-                    logger.info(f"最佳预测模型已复制到 {save_path}")
+                    # 检查源路径和目标路径是否相同，避免复制到相同位置
+                    if os.path.abspath(best_model_path) != os.path.abspath(save_path):
+                        os.makedirs(save_path, exist_ok=True)
+                        os.system(f"cp -r {best_model_path}/* {save_path}/")
+                        logger.info(f"最佳预测模型已复制到 {save_path}")
+                    else:
+                        logger.info(f"最佳预测模型源路径与目标路径相同，跳过复制: {best_model_path}")
                     
                     # 同时复制到历史最佳模型路径
                     if hasattr(config, 'his_best_predictor_path') and config.his_best_predictor_path:
-                        os.makedirs(config.his_best_predictor_path, exist_ok=True)
-                        os.system(f"cp -r {best_model_path}/* {config.his_best_predictor_path}/")
-                        logger.info(f"最佳预测模型已复制到历史路径 {config.his_best_predictor_path}")
+                        # 检查源路径和目标路径是否相同，避免复制到相同位置
+                        if os.path.abspath(best_model_path) != os.path.abspath(config.his_best_predictor_path):
+                            os.makedirs(config.his_best_predictor_path, exist_ok=True)
+                            os.system(f"cp -r {best_model_path}/* {config.his_best_predictor_path}/")
+                            logger.info(f"最佳预测模型已复制到历史路径 {config.his_best_predictor_path}")
+                        else:
+                            logger.info(f"最佳预测模型路径与历史路径相同，跳过复制: {config.his_best_predictor_path}")
                     
                     # 注意：不需要更新config.his_best_predictor_path，它应该保持为历史模型目录路径
         
@@ -1856,21 +1876,33 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
                 best_loss = current_test_loss
                 
                 # 复制到当前训练的最佳模型路径
-                os.makedirs(save_path, exist_ok=True)
-                os.system(f"cp -r {current_model_path}/* {save_path}/")
-                logger.info(f"当前{model_type}模型是新的最佳模型，已保存到 {save_path}")
+                # 检查源路径和目标路径是否相同，避免复制到相同位置
+                if os.path.abspath(current_model_path) != os.path.abspath(save_path):
+                    os.makedirs(save_path, exist_ok=True)
+                    os.system(f"cp -r {current_model_path}/* {save_path}/")
+                    logger.info(f"当前{model_type}模型是新的最佳模型，已保存到 {save_path}")
+                else:
+                    logger.info(f"当前{model_type}模型源路径与目标路径相同，跳过复制: {current_model_path}")
                 
                 # 同时复制到历史最佳模型路径
                 if model_type == 'tokenizer':
                     if hasattr(config, 'his_best_tokenizer_path') and config.his_best_tokenizer_path:
-                        os.makedirs(config.his_best_tokenizer_path, exist_ok=True)
-                        os.system(f"cp -r {current_model_path}/* {config.his_best_tokenizer_path}/")
-                        logger.info(f"最佳分词模型已复制到历史路径 {config.his_best_tokenizer_path}")
+                        # 检查源路径和目标路径是否相同，避免复制到相同位置
+                        if os.path.abspath(current_model_path) != os.path.abspath(config.his_best_tokenizer_path):
+                            os.makedirs(config.his_best_tokenizer_path, exist_ok=True)
+                            os.system(f"cp -r {current_model_path}/* {config.his_best_tokenizer_path}/")
+                            logger.info(f"最佳分词模型已复制到历史路径 {config.his_best_tokenizer_path}")
+                        else:
+                            logger.info(f"最佳分词模型路径与历史路径相同，跳过复制: {config.his_best_tokenizer_path}")
                 else:
                     if hasattr(config, 'his_best_predictor_path') and config.his_best_predictor_path:
-                        os.makedirs(config.his_best_predictor_path, exist_ok=True)
-                        os.system(f"cp -r {current_model_path}/* {config.his_best_predictor_path}/")
-                        logger.info(f"最佳预测模型已复制到历史路径 {config.his_best_predictor_path}")
+                        # 检查源路径和目标路径是否相同，避免复制到相同位置
+                        if os.path.abspath(current_model_path) != os.path.abspath(config.his_best_predictor_path):
+                            os.makedirs(config.his_best_predictor_path, exist_ok=True)
+                            os.system(f"cp -r {current_model_path}/* {config.his_best_predictor_path}/")
+                            logger.info(f"最佳预测模型已复制到历史路径 {config.his_best_predictor_path}")
+                        else:
+                            logger.info(f"最佳预测模型路径与历史路径相同，跳过复制: {config.his_best_predictor_path}")
                 
                 # 更新评估信息
                 eval_info['best_loss'] = best_loss
@@ -1937,24 +1969,34 @@ def update_best_model_paths(config, best_model_dir=None):
             tokenizer_src = config.his_best_tokenizer_path
             tokenizer_dst = os.path.join(best_model_dir, 'best_tokenizer')
             if os.path.exists(tokenizer_src):
-                # 创建目标目录
-                os.makedirs(tokenizer_dst, exist_ok=True)
-                # 复制模型文件
-                os.system(f"cp -r {tokenizer_src}/* {tokenizer_dst}/")
-                logger.info(f"已更新历史最佳分词模型: {tokenizer_src} -> {tokenizer_dst}")
-                tokenizer_path = tokenizer_dst
+                # 检查源路径和目标路径是否相同，避免复制到相同位置
+                if os.path.abspath(tokenizer_src) != os.path.abspath(tokenizer_dst):
+                    # 创建目标目录
+                    os.makedirs(tokenizer_dst, exist_ok=True)
+                    # 复制模型文件
+                    os.system(f"cp -r {tokenizer_src}/* {tokenizer_dst}/")
+                    logger.info(f"已更新历史最佳分词模型: {tokenizer_src} -> {tokenizer_dst}")
+                    tokenizer_path = tokenizer_dst
+                else:
+                    logger.info(f"分词模型源路径与目标路径相同，跳过复制: {tokenizer_src}")
+                    tokenizer_path = tokenizer_src
         
         # 预测模型
         if hasattr(config, 'his_best_predictor_path') and config.his_best_predictor_path:
             predictor_src = config.his_best_predictor_path
             predictor_dst = os.path.join(best_model_dir, 'best_predictor')
             if os.path.exists(predictor_src):
-                # 创建目标目录
-                os.makedirs(predictor_dst, exist_ok=True)
-                # 复制模型文件
-                os.system(f"cp -r {predictor_src}/* {predictor_dst}/")
-                logger.info(f"已更新历史最佳预测模型: {predictor_src} -> {predictor_dst}")
-                predictor_path = predictor_dst
+                # 检查源路径和目标路径是否相同，避免复制到相同位置
+                if os.path.abspath(predictor_src) != os.path.abspath(predictor_dst):
+                    # 创建目标目录
+                    os.makedirs(predictor_dst, exist_ok=True)
+                    # 复制模型文件
+                    os.system(f"cp -r {predictor_src}/* {predictor_dst}/")
+                    logger.info(f"已更新历史最佳预测模型: {predictor_src} -> {predictor_dst}")
+                    predictor_path = predictor_dst
+                else:
+                    logger.info(f"预测模型源路径与目标路径相同，跳过复制: {predictor_src}")
+                    predictor_path = predictor_src
         
         # 保存最佳模型信息
         best_model_info = {
@@ -2138,8 +2180,18 @@ def evaluate_models(tokenizer_paths, model_paths, test_data, config, device, sav
                 if save_paths and model_name != "current":
                     # 复制模型和分词器到最终路径
                     logger.info(f"将 {model_name} 模型复制为最终模型")
-                    os.system(f"cp -r {model_path}/* {save_paths['model']}/")
-                    os.system(f"cp -r {tokenizer_path}/* {save_paths['tokenizer']}/")
+                    
+                    # 检查模型路径是否相同，避免复制到相同位置
+                    if os.path.abspath(model_path) != os.path.abspath(save_paths['model']):
+                        os.system(f"cp -r {model_path}/* {save_paths['model']}/")
+                    else:
+                        logger.info(f"模型源路径与目标路径相同，跳过复制: {model_path}")
+                    
+                    # 检查分词器路径是否相同，避免复制到相同位置
+                    if os.path.abspath(tokenizer_path) != os.path.abspath(save_paths['tokenizer']):
+                        os.system(f"cp -r {tokenizer_path}/* {save_paths['tokenizer']}/")
+                    else:
+                        logger.info(f"分词器源路径与目标路径相同，跳过复制: {tokenizer_path}")
         
         logger.info(f"模型评估完成，最佳模型: {best_model_name}，测试损失: {best_val_loss:.4f}")
         return best_model_name, best_val_loss
