@@ -31,7 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # 确保项目根目录在路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import Config
+from optimized_config import OptimizedConfig, create_config_from_args, parse_args
 from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 from utils.training_pipeline_utils import (
     setup_logging,
@@ -65,7 +65,7 @@ class KronosTrainingPipeline:
     Kronos模型训练完整流水线
     """
     
-    def __init__(self, config, use_gpu=True, data_source='qlib'):
+    def __init__(self, config, use_gpu=True, data_source='qlib', early_stopping_patience=3):
         """
         初始化训练流水线
         
@@ -73,10 +73,12 @@ class KronosTrainingPipeline:
             config: 配置对象
             use_gpu: 是否使用GPU训练
             data_source: 数据源类型，'qlib'或'sina'
+            early_stopping_patience: 提前终止的耐心值
         """
         self.config = config
         self.use_gpu = use_gpu
         self.data_source = data_source
+        self.early_stopping_patience = early_stopping_patience
         self.rank = 0
         self.world_size = 1
         self.local_rank = 0
@@ -96,9 +98,12 @@ class KronosTrainingPipeline:
             self.gpu_type = "cpu"
         self.is_master = True  # 单进程或主进程
         
+        # 设置分布式训练标志，避免重复检查
+        self.use_ddp = (use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1)
+        
         # 初始化日志
         setup_logging()
-        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}")
+        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}")
         
         # 设置保存路径，使用config中定义的路径
         self.tokenizer_save_dir = os.path.join(config.save_path, config.tokenizer_save_folder_name)
@@ -130,6 +135,62 @@ class KronosTrainingPipeline:
         # 创建模型历史记录目录
         if hasattr(config, 'model_history_dir') and config.model_history_dir:
             os.makedirs(config.model_history_dir, exist_ok=True)
+    
+    def create_model_from_config(self, config_path: str, model_type: str):
+        """
+        根据配置文件创建模型实例
+        
+        Args:
+            config_path: 配置文件路径
+            model_type: 模型类型，'tokenizer' 或 'predictor'
+        
+        Returns:
+            创建的模型实例
+        """
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            
+            if model_type == 'tokenizer':
+                model = KronosTokenizer(
+                    d_in=config['d_in'],
+                    d_model=config['d_model'],
+                    n_heads=config['n_heads'],
+                    ff_dim=config['ff_dim'],
+                    n_enc_layers=config['n_enc_layers'],
+                    n_dec_layers=config['n_dec_layers'],
+                    ffn_dropout_p=config['ffn_dropout_p'],
+                    attn_dropout_p=config['attn_dropout_p'],
+                    resid_dropout_p=config['resid_dropout_p'],
+                    s1_bits=config['s1_bits'],
+                    s2_bits=config['s2_bits'],
+                    beta=config['beta'],
+                    gamma0=config['gamma0'],
+                    gamma=config['gamma'],
+                    zeta=config['zeta'],
+                    group_size=config['group_size']
+                )
+            else:  # predictor
+                model = Kronos(
+                    s1_bits=config['s1_bits'],
+                    s2_bits=config['s2_bits'],
+                    n_layers=config['n_layers'],
+                    d_model=config['d_model'],
+                    n_heads=config['n_heads'],
+                    ff_dim=config['ff_dim'],
+                    ffn_dropout_p=config['ffn_dropout_p'],
+                    attn_dropout_p=config['attn_dropout_p'],
+                    resid_dropout_p=config['resid_dropout_p'],
+                    token_dropout_p=config['token_dropout_p'],
+                    learn_te=config['learn_te']
+                )
+            
+            logger.info(f"成功从配置文件创建 {model_type} 模型: {config_path}")
+            return model
+            
+        except Exception as e:
+            logger.error(f"从配置文件创建 {model_type} 模型失败: {str(e)}")
+            return None
         
     def setup_distributed(self):
         """设置分布式训练环境"""
@@ -192,7 +253,15 @@ class KronosTrainingPipeline:
         
         # 初始化模型
         try:
-            model = KronosTokenizer.from_pretrained(self.config.pretrained_tokenizer_path)
+            if self.config.model_version == 'customer':
+                # 从自定义配置文件创建模型
+                model = self.create_model_from_config(self.config.custom_tokenizer_config, 'tokenizer')
+                if model is None:
+                    return False
+            else:
+                # 从预训练模型加载
+                model = KronosTokenizer.from_pretrained(self.config.pretrained_tokenizer_path)
+            
             model.to(self.device)
             logger.info(f"分词模型初始化完成 - 大小: {get_model_size(model)}")
         except Exception as e:
@@ -200,11 +269,11 @@ class KronosTrainingPipeline:
             return False
         
         # 设置DDP
-        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+        if self.use_ddp:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
         
         # 创建数据加载器
-        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+        if self.use_ddp:
             train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_ddp(
                 self.config.__dict__, self.rank, self.world_size
             )
@@ -236,6 +305,8 @@ class KronosTrainingPipeline:
         best_val_loss = float('inf')
         batch_idx_global_train = 0
         evaluation_history = []  # 记录每个epoch的评估信息
+        early_stopping_counter = 0  # 提前终止计数器
+        last_test_loss = float('inf')  # 上次测试损失
         
         for epoch_idx in range(self.config.epochs):
             epoch_start_time = time.time()
@@ -259,7 +330,7 @@ class KronosTrainingPipeline:
                     batch_x = ori_batch_x[start_idx:end_idx]
                     
                     # 前向传播
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         zs, bsq_loss, _, _ = model(batch_x)
                     else:
                         zs, bsq_loss, _, _ = model(batch_x)
@@ -277,7 +348,7 @@ class KronosTrainingPipeline:
                 
                 # 优化器步骤
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters() if not self.use_gpu or self.gpu_type != "cuda" or torch.cuda.device_count() <= 1 else model.module.parameters(), 
+                    model.module.parameters() if self.use_ddp else model.parameters(), 
                     max_norm=2.0
                 )
                 optimizer.step()
@@ -306,7 +377,7 @@ class KronosTrainingPipeline:
             with torch.no_grad():
                 for ori_batch_x, _ in val_loader:
                     ori_batch_x = ori_batch_x.squeeze(0).to(self.device)
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         zs, _, _, _ = model(ori_batch_x)
                     else:
                         zs, _, _, _ = model(ori_batch_x)
@@ -317,7 +388,7 @@ class KronosTrainingPipeline:
                     val_sample_count += ori_batch_x.size(0)
             
             # 如果是分布式训练，收集所有进程的验证损失
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 val_loss_sum_tensor = torch.tensor(tot_val_loss, device=self.device)
                 val_count_tensor = torch.tensor(val_sample_count, device=self.device)
                 dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
@@ -345,7 +416,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         model.module.save_pretrained(temp_save_path)
                     else:
                         model.save_pretrained(temp_save_path)
@@ -375,7 +446,7 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_tokenizer_path
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         model.module.save_pretrained(save_path)
                     else:
                         model.save_pretrained(save_path)
@@ -383,8 +454,26 @@ class KronosTrainingPipeline:
                     if comet_logger:
                         comet_logger.log_model("best_model", save_path)
             
+            # 基于测试集的提前终止逻辑
+            if hasattr(self, 'test_data') and self.test_data is not None:
+                # 如果有测试数据，检查测试损失是否改善
+                if self.best_tokenizer_test_loss < float('inf'):
+                    if self.best_tokenizer_test_loss >= last_test_loss:
+                        early_stopping_counter += 1
+                        logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
+                    else:
+                        early_stopping_counter = 0  # 重置计数器
+                        logger.info(f"测试损失改善，重置提前终止计数器")
+                    
+                    last_test_loss = self.best_tokenizer_test_loss
+                    
+                    # 检查是否需要提前终止
+                    if early_stopping_counter >= self.early_stopping_patience:
+                        logger.info(f"提前终止训练：连续 {self.early_stopping_patience} 个epoch测试损失未改善")
+                        break
+            
             # 同步所有进程
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 dist.barrier()
         
         # 保存训练摘要
@@ -437,7 +526,15 @@ class KronosTrainingPipeline:
             tokenizer.eval().to(self.device)
             logger.info("分词模型加载完成")
             
-            model = Kronos.from_pretrained(self.config.pretrained_predictor_path)
+            if self.config.model_version == 'customer':
+                # 从自定义配置文件创建模型
+                model = self.create_model_from_config(self.config.custom_predictor_config, 'predictor')
+                if model is None:
+                    return False
+            else:
+                # 从预训练模型加载
+                model = Kronos.from_pretrained(self.config.pretrained_predictor_path)
+            
             model.to(self.device)
             logger.info(f"预测模型初始化完成 - 大小: {get_model_size(model)}")
         except Exception as e:
@@ -445,11 +542,11 @@ class KronosTrainingPipeline:
             return False
         
         # 设置DDP
-        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+        if self.use_ddp:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
         
         # 创建数据加载器
-        if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+        if self.use_ddp:
             train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_ddp(
                 self.config.__dict__, self.rank, self.world_size
             )
@@ -482,6 +579,8 @@ class KronosTrainingPipeline:
         best_val_loss = float('inf')
         batch_idx_global = 0
         evaluation_history = []  # 记录每个epoch的评估信息
+        early_stopping_counter = 0  # 提前终止计数器
+        last_test_loss = float('inf')  # 上次测试损失
         
         for epoch_idx in range(self.config.epochs):
             epoch_start_time = time.time()
@@ -508,7 +607,7 @@ class KronosTrainingPipeline:
                 
                 # 前向传播和损失计算
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                if self.use_ddp:
                     loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 else:
                     loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
@@ -517,7 +616,7 @@ class KronosTrainingPipeline:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters() if not self.use_gpu or self.gpu_type != "cuda" or torch.cuda.device_count() <= 1 else model.module.parameters(), 
+                    model.module.parameters() if self.use_ddp else model.parameters(), 
                     max_norm=3.0
                 )
                 optimizer.step()
@@ -554,7 +653,7 @@ class KronosTrainingPipeline:
                     token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
                     
                     logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         val_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     else:
                         val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
@@ -563,7 +662,7 @@ class KronosTrainingPipeline:
                     val_batches_processed += 1
             
             # 如果是分布式训练，收集所有进程的验证损失
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 val_loss_sum_tensor = torch.tensor(tot_val_loss, device=self.device)
                 val_batches_tensor = torch.tensor(val_batches_processed, device=self.device)
                 dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
@@ -591,7 +690,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         model.module.save_pretrained(temp_save_path)
                     else:
                         model.save_pretrained(temp_save_path)
@@ -621,7 +720,7 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_predictor_path
-                    if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+                    if self.use_ddp:
                         model.module.save_pretrained(save_path)
                     else:
                         model.save_pretrained(save_path)
@@ -629,8 +728,26 @@ class KronosTrainingPipeline:
                     if comet_logger:
                         comet_logger.log_model("best_model", save_path)
             
+            # 基于测试集的提前终止逻辑
+            if hasattr(self, 'test_data') and self.test_data is not None:
+                # 如果有测试数据，检查测试损失是否改善
+                if self.best_predictor_test_loss < float('inf'):
+                    if self.best_predictor_test_loss >= last_test_loss:
+                        early_stopping_counter += 1
+                        logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
+                    else:
+                        early_stopping_counter = 0  # 重置计数器
+                        logger.info(f"测试损失改善，重置提前终止计数器")
+                    
+                    last_test_loss = self.best_predictor_test_loss
+                    
+                    # 检查是否需要提前终止
+                    if early_stopping_counter >= self.early_stopping_patience:
+                        logger.info(f"提前终止训练：连续 {self.early_stopping_patience} 个epoch测试损失未改善")
+                        break
+            
             # 同步所有进程
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 dist.barrier()
         
         # 保存训练摘要
@@ -772,7 +889,7 @@ class KronosTrainingPipeline:
         """运行完整训练流水线"""
         try:
             # 设置分布式环境（如果使用CUDA多GPU）
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 self.setup_distributed()
             
             # 处理数据并加载测试数据
@@ -822,7 +939,7 @@ class KronosTrainingPipeline:
                     logger.warning("更新历史最佳模型路径失败")
             
             # 清理分布式环境
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 cleanup_ddp()
                 
             return True
@@ -832,107 +949,33 @@ class KronosTrainingPipeline:
             logger.error(traceback.format_exc())
             
             # 清理分布式环境
-            if self.use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1:
+            if self.use_ddp:
                 cleanup_ddp()
                 
             return False
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='Kronos模型训练流水线')
-    parser.add_argument('--cpu', action='store_true', default=False, help='使用CPU训练')
-    parser.add_argument('--data-source', type=str, default='sina', choices=['qlib', 'sina'], help='数据源类型')
-    parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
-    parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')
-    parser.add_argument('--model-version', type=str, default='base', choices=['mini', 'small', 'base'],
-                        help='模型版本: mini(小), small(中), base(大)')
-    return parser.parse_args()
+# parse_args 函数已移至 optimized_config.py 中
 
 
 def main():
     """主函数"""
     args = parse_args()
     
-    # 设置配置
-    config = Config()
-    if args.config_path:
-        # 从文件加载配置
-        pass
-
-    config.qlib_data_path = './qlib_bin'
-    config.data_source = args.data_source  # 添加数据来源到配置中
-    
-    # 设置总的时间范围为最近2年，测试集和验证集的范围为最近半年
-    current_date = datetime.now()
-    two_years_ago = (current_date - timedelta(days=365*2)).strftime('%Y-%m-%d')
-    six_months_ago = (current_date - timedelta(days=365/2)).strftime('%Y-%m-%d')
-    current_date_str = current_date.strftime('%Y-%m-%d')
-    
-    config.dataset_begin_time = two_years_ago
-    config.dataset_end_time = current_date_str
-    config.train_time_range = [two_years_ago, six_months_ago]
-    config.val_time_range = [six_months_ago, current_date_str]
-    config.test_time_range = [six_months_ago, current_date_str]
-    config.backtest_time_range = [six_months_ago, current_date_str]
-
-    config.epochs = 8
-    config.batch_size = 50
-    config.n_train_iter = 80000
-    config.n_val_iter = 40
-    config.use_comet = False
-    config.max_sina_symbols = 100
-    
-    # 根据选择的模型版本设置预训练模型路径
-    model_versions = {
-        'mini': {
-            'tokenizer': 'NeoQuasar/Kronos-Tokenizer-2k',
-            'predictor': 'NeoQuasar/Kronos-mini'
-        },
-        'small': {
-            'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
-            'predictor': 'NeoQuasar/Kronos-small'
-        },
-        'base': {
-            'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
-            'predictor': 'NeoQuasar/Kronos-base'
-        }
-    }
-    config.force_download_data = args.force_download
-    # 使用选择的模型版本
-    model_version = args.model_version
-    logger.info(f"使用模型版本: {model_version}")
-    
-    # 保存模型版本信息，供训练流水线使用
-    config.model_version = model_version
-    
-    config.save_path = f"./outputs/{args.data_source}/{model_version}"
-    config.pretrained_tokenizer_path = model_versions[model_version]['tokenizer']
-    config.pretrained_predictor_path = model_versions[model_version]['predictor']
-    config.tokenizer_save_folder_name = 'finetune_tokenizer'
-    config.predictor_save_folder_name = 'finetune_predictor'
-    config.backtest_save_folder_name = 'finetune_backtest'
-    # 保存训练过程中在测试集上评估过的最好模型，实时更新，每个epoch如果有最好的模型则需要更新
-    config.finetuned_tokenizer_path = f"{config.save_path}/{config.tokenizer_save_folder_name}/best_model"
-    config.finetuned_predictor_path = f"{config.save_path}/{config.predictor_save_folder_name}/best_model"
-
-    # 历史模型记录目录
-    config.model_history_dir = "./model_history"
-    # 历史最佳模型路径，用于存储历史上表现最好的模型
-    # 包含数据类型和模型版本号
-    history_subdir = f"{args.data_source}/{model_version}"
-    model_history_subdir = os.path.join(config.model_history_dir, history_subdir)
-    os.makedirs(model_history_subdir, exist_ok=True)
-    
-    # 历史最好的模型记录，当前训练完成后需要把最好的模型更新到该文件夹中去，所有epoch训练完成后需要更新
-    config.his_best_tokenizer_path = os.path.join(model_history_subdir, "best_tokenizer")
-    config.his_best_predictor_path = os.path.join(model_history_subdir, "best_predictor")
+    # 使用优化配置类创建配置
+    try:
+        config = create_config_from_args(args)
+        logger.info(f"配置初始化完成: {config}")
+    except Exception as e:
+        logger.error(f"配置初始化失败: {str(e)}")
+        return 1
 
     # 创建并运行流水线
     pipeline = KronosTrainingPipeline(
         config=config,
         use_gpu=not args.cpu,
-        data_source=args.data_source
+        data_source=args.data_source,
+        early_stopping_patience=args.early_stopping_patience
     )
     success = pipeline.run_pipeline()
     
@@ -940,4 +983,7 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as e:
+        logger.error(traceback.format_exc())

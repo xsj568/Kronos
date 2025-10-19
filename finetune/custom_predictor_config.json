@@ -1,0 +1,13 @@
+{
+  "s1_bits": 10,
+  "s2_bits": 10,
+  "n_layers": 2,
+  "d_model": 832,
+  "n_heads": 16,
+  "ff_dim": 2048,
+  "ffn_dropout_p": 0.2,
+  "attn_dropout_p": 0.0,
+  "resid_dropout_p": 0.2,
+  "token_dropout_p": 0.0,
+  "learn_te": true
+}

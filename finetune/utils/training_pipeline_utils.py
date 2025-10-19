@@ -83,6 +83,11 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs'):
     """
     import pytz
     
+    # 检查是否已经设置过日志
+    root_logger = logging.getLogger()
+    if hasattr(setup_logging, '_initialized') and setup_logging._initialized:
+        return logging.getLogger('KronosPipeline')
+    
     # 设置上海时区
     shanghai_tz = pytz.timezone('Asia/Shanghai')
     
@@ -110,7 +115,6 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs'):
     )
     
     # 配置根日志记录器
-    root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     
     # 清除现有的处理器
@@ -127,6 +131,9 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs'):
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
+    
+    # 标记为已初始化
+    setup_logging._initialized = True
     
     logger = logging.getLogger('KronosPipeline')
     logger.info(f"日志文件: {log_filepath} (上海时区)")
@@ -1496,12 +1503,13 @@ def compare_and_select_best_model(model_type, config, test_data, device, history
         
         # 确定要比较的模型路径和名称
         if model_type == 'tokenizer':
-            # 基础模型（远程模型）
+            # 基础模型（远程模型）- 只有当预训练路径存在时才添加
             base_model_path = config.pretrained_tokenizer_path
-            models_to_compare['base'] = {
-                'path': base_model_path,
-                'is_remote': True  # 基础模型从远程加载
-            }
+            if base_model_path is not None:
+                models_to_compare['base'] = {
+                    'path': base_model_path,
+                    'is_remote': True  # 基础模型从远程加载
+                }
             
             # 历史最佳模型
             history_best_path = config.finetuned_tokenizer_path
@@ -1542,12 +1550,13 @@ def compare_and_select_best_model(model_type, config, test_data, device, history
             # 获取分词器路径
             tokenizer_path = config.finetuned_tokenizer_path
             
-            # 基础模型（远程模型）
+            # 基础模型（远程模型）- 只有当预训练路径存在时才添加
             base_model_path = config.pretrained_predictor_path
-            models_to_compare['base'] = {
-                'path': base_model_path,
-                'is_remote': True  # 基础模型从远程加载
-            }
+            if base_model_path is not None:
+                models_to_compare['base'] = {
+                    'path': base_model_path,
+                    'is_remote': True  # 基础模型从远程加载
+                }
             
             # 历史最佳模型
             history_best_path = config.finetuned_predictor_path
@@ -1680,12 +1689,13 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
             models_to_evaluate = {}
             
             if model_type == 'tokenizer':
-                # 添加基础模型（远程模型）
+                # 添加基础模型（远程模型）- 只有当预训练路径存在时才添加
                 base_path = config.pretrained_tokenizer_path
-                models_to_evaluate['base'] = {
-                    'path': base_path,
-                    'is_remote': True  # 基础模型从远程加载
-                }
+                if base_path is not None:
+                    models_to_evaluate['base'] = {
+                        'path': base_path,
+                        'is_remote': True  # 基础模型从远程加载
+                    }
                 
                 # 添加历史最佳模型（如果存在且不同于基础模型）
                 if hasattr(config, 'his_best_tokenizer_path') and config.his_best_tokenizer_path:
@@ -1765,12 +1775,13 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
             else:  # predictor
                 tokenizer_path = config.finetuned_tokenizer_path
                 
-                # 添加基础模型（远程模型）
+                # 添加基础模型（远程模型）- 只有当预训练路径存在时才添加
                 base_path = config.pretrained_predictor_path
-                models_to_evaluate['base'] = {
-                    'path': base_path,
-                    'is_remote': True  # 基础模型从远程加载
-                }
+                if base_path is not None:
+                    models_to_evaluate['base'] = {
+                        'path': base_path,
+                        'is_remote': True  # 基础模型从远程加载
+                    }
                 
                 # 添加历史最佳模型（如果存在且不同于基础模型）
                 if hasattr(config, 'his_best_predictor_path') and config.his_best_predictor_path:

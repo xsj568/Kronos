@@ -1,3 +1,18 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Kronos Qlib 回测测试脚本
+已优化为使用 OptimizedConfig 配置类
+
+主要改进：
+1. 使用 OptimizedConfig 替代旧的 Config 类
+2. 支持命令行参数指定数据源和模型版本
+3. 支持自定义模型路径
+4. 支持 CPU、GPU 和 MPS 设备
+5. 自动检测最佳可用设备
+"""
+
 import os
 import sys
 import argparse
@@ -21,7 +36,7 @@ from qlib.utils.time import Freq
 
 # Ensure project root is in the Python path
 sys.path.append("../")
-from config import Config
+from optimized_config import OptimizedConfig
 from model.kronos import Kronos, KronosTokenizer, auto_regressive_inference
 
 
@@ -38,7 +53,7 @@ class QlibTestDataset(Dataset):
     predictions back to the original time series.
     """
 
-    def __init__(self, data: dict, config: Config):
+    def __init__(self, data: dict, config: OptimizedConfig):
         self.data = data
         self.config = config
         self.window_size = config.lookback_window + config.predict_window
@@ -98,7 +113,7 @@ class QlibBacktest:
     A wrapper class for conducting backtesting experiments using Qlib.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: OptimizedConfig):
         self.config = config
         self.initialize_qlib()
 
@@ -201,15 +216,55 @@ class QlibBacktest:
 
 
 # =================================================================================
-# 3. Inference Logic (CPU)
+# 3. Inference Logic
 # =================================================================================
 
-def load_models(config: dict) -> tuple[KronosTokenizer, Kronos]:
-    """Loads the fine-tuned tokenizer and predictor model on CPU."""
-    device = torch.device('cpu')
-    print(f"Loading models onto device: {device} (forced CPU)...")
-    tokenizer = KronosTokenizer.from_pretrained(config['tokenizer_path']).to(device).eval()
-    model = Kronos.from_pretrained(config['model_path']).to(device).eval()
+def get_device(use_gpu: bool = True) -> tuple[torch.device, str]:
+    """
+    获取最佳可用设备
+    
+    Args:
+        use_gpu: 是否尝试使用GPU
+        
+    Returns:
+        tuple: (device, device_type)
+    """
+    if use_gpu:
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+            device_type = "cuda"
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+            device_type = "mps"
+        else:
+            device = torch.device("cpu")
+            device_type = "cpu"
+    else:
+        device = torch.device("cpu")
+        device_type = "cpu"
+    
+    return device, device_type
+
+
+def load_models(config: dict, device: torch.device) -> tuple[KronosTokenizer, Kronos]:
+    """Loads the fine-tuned tokenizer and predictor model on specified device."""
+    print(f"Loading models onto device: {device}...")
+    
+    # Check if model paths exist
+    tokenizer_path = config['tokenizer_path']
+    model_path = config['model_path']
+    
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(f"Tokenizer model not found at: {tokenizer_path}")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Predictor model not found at: {model_path}")
+    
+    print(f"Loading tokenizer from: {tokenizer_path}")
+    tokenizer = KronosTokenizer.from_pretrained(tokenizer_path, local_files_only=True).to(device).eval()
+    
+    print(f"Loading predictor from: {model_path}")
+    model = Kronos.from_pretrained(model_path, local_files_only=True).to(device).eval()
+    
     return tokenizer, model
 
 
@@ -236,34 +291,40 @@ def collate_fn_for_inference(batch):
     return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(timestamps)
 
 
-def generate_predictions(config: dict, test_data: dict) -> dict[str, pd.DataFrame]:
+def generate_predictions(config: dict, test_data: dict, device: torch.device) -> dict[str, pd.DataFrame]:
     """
-    Runs inference on the test dataset to generate prediction signals (CPU-only).
+    Runs inference on the test dataset to generate prediction signals.
 
     Args:
         config (dict): A dictionary containing inference parameters.
         test_data (dict): The raw test data loaded from a pickle file.
+        device (torch.device): Device to run inference on.
 
     Returns:
         A dictionary where keys are signal types (e.g., 'mean', 'last') and
         values are DataFrames of predictions (datetime index, symbol columns).
     """
-    tokenizer, model = load_models(config)
-    device = torch.device('cpu')
+    tokenizer, model = load_models(config, device)
 
     # Use the Dataset and DataLoader for efficient batching and processing
-    dataset = QlibTestDataset(data=test_data, config=Config())
+    # Create a basic config for dataset processing
+    dataset_config = OptimizedConfig(data_source=config.get('data_source', 'qlib'), use_gpu=False)
+    dataset = QlibTestDataset(data=test_data, config=dataset_config)
+    
+    # Adjust num_workers based on device type
+    num_workers = 1 #0 if device.type == 'cpu' else 2
+    
     loader = DataLoader(
         dataset,
         batch_size=max(1, config['batch_size'] // config['sample_count']),
         shuffle=False,
-        num_workers=0,  # CPU-friendly: avoid multiprocessing overhead
+        num_workers=num_workers,
         collate_fn=collate_fn_for_inference
     )
 
     results = defaultdict(list)
     with torch.no_grad():
-        for x, x_stamp, y_stamp, symbols, timestamps in tqdm(loader, desc="Inference (CPU)"):
+        for x, x_stamp, y_stamp, symbols, timestamps in tqdm(loader, desc=f"Inference ({device.type.upper()})"):
             preds = auto_regressive_inference(
                 tokenizer, model, x.to(device), x_stamp.to(device), y_stamp.to(device),
                 max_context=config['max_context'], pred_len=config['pred_len'], clip=config['clip'],
@@ -296,27 +357,80 @@ def generate_predictions(config: dict, test_data: dict) -> dict[str, pd.DataFram
 
 
 # =================================================================================
-# 4. Main Execution (CPU)
+# 4. Main Execution
 # =================================================================================
 
 def main():
-    """Main function to set up config, run inference, and execute backtesting on CPU."""
-    parser = argparse.ArgumentParser(description="Run Kronos Inference and Backtesting (CPU)")
-    # Accept but ignore device arg; always force CPU
-    parser.add_argument("--device", type=str, default="cpu", help="Device for inference; ignored (CPU forced)")
+    """
+    主函数：设置配置、运行推理和执行回测
+    
+    使用示例：
+        # 使用默认配置（sina数据源，base模型，自动检测设备）
+        python qlib_test_cpu.py
+        
+        # 使用sina数据源和mini模型
+        python qlib_test_cpu.py --data-source sina --model-version mini
+        
+        # 强制使用CPU
+        python qlib_test_cpu.py --device cpu
+        
+        # 使用自定义模型路径
+        python qlib_test_cpu.py --tokenizer-path /path/to/tokenizer --model-path /path/to/model
+    """
+    parser = argparse.ArgumentParser(description="Run Kronos Inference and Backtesting")
+    parser.add_argument("--device", type=str, default="mps", choices=['auto', 'cpu', 'cuda', 'mps'],
+                        help="Device for inference (auto=detect best available)")
+    parser.add_argument("--data-source", type=str, default="sina", choices=['qlib', 'sina'], 
+                        help="Data source type")
+    parser.add_argument("--model-version", type=str, default="mini",
+                        choices=['mini', 'small', 'base', 'customer'],
+                        help="Model version to use")
+    parser.add_argument("--tokenizer-path", type=str, default=None, 
+                        help="Path to tokenizer model (overrides default)")
+    parser.add_argument("--model-path", type=str, default=None, 
+                        help="Path to predictor model (overrides default)")
     args = parser.parse_args()
 
-    # --- 1. Configuration Setup ---
-    base_config = Config()
+    # --- 1. Device Setup ---
+    if args.device == "auto":
+        use_gpu = True
+    elif args.device == "cpu":
+        use_gpu = False
+    else:
+        use_gpu = True
+    
+    device, device_type = get_device(use_gpu)
+    
+    # Override device if specifically requested
+    if args.device in ['cuda', 'mps']:
+        if args.device == 'cuda' and torch.cuda.is_available():
+            device = torch.device("cuda:0")
+            device_type = "cuda"
+        elif args.device == 'mps' and torch.backends.mps.is_available():
+            device = torch.device("mps")
+            device_type = "mps"
+        else:
+            print(f"Warning: {args.device} not available, falling back to {device}")
+    
+    # --- 2. Configuration Setup ---
+    base_config = OptimizedConfig(
+        data_source=args.data_source, 
+        model_version=args.model_version,
+        use_gpu=(device_type != 'cpu')
+    )
 
+    # Override paths if provided via command line
+    tokenizer_path = args.tokenizer_path if args.tokenizer_path else base_config.finetuned_tokenizer_path
+    model_path = args.model_path if args.model_path else base_config.finetuned_predictor_path
+    
     # Create a dedicated dictionary for this run's configuration
     run_config = {
         'device': 'cpu',  # forced CPU
         'data_path': base_config.dataset_path,
         'result_save_path': base_config.backtest_result_path,
         'result_name': base_config.backtest_save_folder_name,
-        'tokenizer_path': base_config.finetuned_tokenizer_path,
-        'model_path': base_config.finetuned_predictor_path,
+        'tokenizer_path': tokenizer_path,
+        'model_path': model_path,
         'max_context': base_config.max_context,
         'pred_len': base_config.predict_window,
         'clip': base_config.clip,
@@ -327,21 +441,27 @@ def main():
         'batch_size': base_config.backtest_batch_size,
     }
 
-    print("--- Running with Configuration (CPU) ---")
+    print("\n" + "=" * 70)
+    print("Kronos 回测配置")
+    print("=" * 70)
+    print(f"数据源: {args.data_source}")
+    print(f"模型版本: {args.model_version}")
+    print(f"设备类型: {device_type.upper()} ({device})")
+    print("-" * 70)
     for key, val in run_config.items():
         print(f"{key:>20}: {val}")
-    print("-" * 35)
+    print("=" * 70 + "\n")
 
-    # --- 2. Load Data ---
+    # --- 3. Load Data ---
     test_data_path = os.path.join(run_config['data_path'], "test_data.pkl")
     print(f"Loading test data from {test_data_path}...")
     with open(test_data_path, 'rb') as f:
         test_data = pickle.load(f)
 
-    # --- 3. Generate Predictions ---
-    model_preds = generate_predictions(run_config, test_data)
+    # --- 4. Generate Predictions ---
+    model_preds = generate_predictions(run_config, test_data, device)
 
-    # --- 4. Save Predictions ---
+    # --- 5. Save Predictions ---
     save_dir = os.path.join(run_config['result_save_path'], run_config['result_name'])
     os.makedirs(save_dir, exist_ok=True)
     predictions_file = os.path.join(save_dir, "predictions.pkl")
@@ -349,7 +469,7 @@ def main():
     with open(predictions_file, 'wb') as f:
         pickle.dump(model_preds, f)
 
-    # --- 5. Run Backtesting ---
+    # --- 6. Run Backtesting ---
     with open(predictions_file, 'rb') as f:
         model_preds = pickle.load(f)
 
