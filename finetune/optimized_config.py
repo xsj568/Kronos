@@ -119,7 +119,7 @@ class OptimizedConfig:
         
         # 数据源特定配置
         if self.data_source == 'sina':
-            self.max_sina_symbols = 10
+            self.max_sina_symbols = 10000
         else:  # qlib
             self.max_sina_symbols = None
     
@@ -196,10 +196,10 @@ class OptimizedConfig:
     def _init_training_config(self):
         """初始化训练相关配置"""
         # 训练超参数
-        self.epochs = 2
+        self.epochs = 30
         self.batch_size = 50
         self.log_interval = 100  # Log training status every N batches
-        self.accumulation_steps = 1
+        self.accumulation_steps = 10
         
         # 学习率配置
         self.tokenizer_learning_rate = 2e-4
@@ -211,11 +211,11 @@ class OptimizedConfig:
         self.adam_weight_decay = 0.1
         
         # 训练迭代配置 - 根据batch_size动态计算
-        self.n_train_iter = 80000
+        self.n_train_iter = 800000
         self.n_val_iter = 40
         
         # 提前终止配置
-        self.early_stopping_patience = 3
+        self.early_stopping_patience = 6
     
     def _init_paths_config(self):
         """初始化路径相关配置"""
@@ -464,13 +464,13 @@ def parse_args():
     parser.add_argument('--data-source', type=str, default='sina', choices=['qlib', 'sina'], help='数据源类型')
     parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
     parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')
-    parser.add_argument('--model-version', type=str, default='customer', choices=['mini', 'small', 'base', 'customer'],
+    parser.add_argument('--model-version', type=str, default='base', choices=['mini', 'small', 'base', 'customer'],
                         help='模型版本: mini(小), small(中), base(大), customer(自定义配置)')
     parser.add_argument('--custom-tokenizer-config', type=str, default='custom_tokenizer_config.json',
                         help='自定义tokenizer配置文件路径')
     parser.add_argument('--custom-predictor-config', type=str, default='custom_predictor_config.json',
                         help='自定义predictor配置文件路径')
-    parser.add_argument('--early-stopping-patience', type=int, default=1,
+    parser.add_argument('--early-stopping-patience', type=int, default=8,
                         help='提前终止的耐心值（连续多少个epoch测试损失没有提升就停止）')
     return parser.parse_args()
 

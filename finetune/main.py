@@ -55,6 +55,7 @@ from utils.training_pipeline_utils import (
     get_shanghai_time
 )
 from common_data_processor import DataProcessorFactory, FinancialDataset
+from prediction_incremental_updater import PredictionIncrementalUpdater
 
 # 全局日志记录器
 logger = logging.getLogger('KronosPipeline')
@@ -852,36 +853,103 @@ class KronosTrainingPipeline:
         return evaluate_model_on_test_data(model, tokenizer, test_data, self.config, self.device)
 
     def predict(self):
-        """使用训练好的模型进行预测未来10个工作日的股票走势"""
+        """
+        使用训练好的模型进行预测
+        1. 预测未来10个工作日的股票走势（详细预测，保存到日期时间戳文件）
+        2. 预测下一个工作日的涨跌幅（简化预测，增量更新到主Excel文件）
+        """
         if not self.is_master:
             return True
             
-        logger.info("开始预测未来10个工作日的股票走势...")
+        logger.info("=" * 60)
+        logger.info("开始预测股票走势...")
+        logger.info("=" * 60)
+        
         try:
             # 加载最佳模型
+            logger.info("加载最佳模型...")
             tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path, local_files_only=True)
             tokenizer.eval().to(self.device)
             
             model = Kronos.from_pretrained(self.config.finetuned_predictor_path, local_files_only=True)
             model.eval().to(self.device)
+            logger.info("✓ 模型加载成功")
             
             # 加载最新的测试数据
             test_data_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
             logger.info(f"加载最新数据: {test_data_path}")
             with open(test_data_path, 'rb') as f:
                 test_data = pickle.load(f)
+            logger.info(f"✓ 加载了 {len(test_data)} 支股票的数据")
             
-            # 使用工具函数进行预测
+            # ========== 1. 详细预测：预测未来10个工作日 ==========
+            logger.info("\n" + "=" * 60)
+            logger.info("执行详细预测：预测未来10个工作日...")
+            logger.info("=" * 60)
             save_dir = self.config.save_path
             prediction_dfs = predict_future_trends(
                 tokenizer, model, test_data, self.config, 
                 self.device, save_dir
             )
             
-            return prediction_dfs is not None
+            if prediction_dfs is None:
+                logger.error("详细预测失败")
+                return False
+            
+            logger.info("✓ 详细预测完成")
+            
+            # ========== 2. 简化预测：只预测下一个工作日并增量更新 ==========
+            logger.info("\n" + "=" * 60)
+            logger.info("执行简化预测：预测下一个工作日涨跌幅...")
+            logger.info("=" * 60)
+            
+            # 从详细预测结果中提取第一天的预测
+            if 'detailed' in prediction_dfs and not prediction_dfs['detailed'].empty:
+                detailed_df = prediction_dfs['detailed']
+                
+                # 只保留第一天的预测数据
+                next_day_columns = ['stock_code', 
+                                   'current_open', 'current_high', 'current_low', 'current_close', 'current_volume',
+                                   'day_1_date', 'day_1_open', 'day_1_high', 'day_1_low', 'day_1_close', 'day_1_volume',
+                                   'day_1_open_change_pct', 'day_1_high_change_pct', 'day_1_low_change_pct', 
+                                   'day_1_close_change_pct', 'day_1_volume_change_pct']
+                
+                next_day_prediction = detailed_df[next_day_columns].copy()
+                
+                # 初始化增量更新器
+                master_excel_path = os.path.join(save_dir, "predictions_master.xlsx")
+                updater = PredictionIncrementalUpdater(master_excel_path)
+                
+                # 获取预测日期（使用上海时间）
+                shanghai_time = get_shanghai_time()
+                prediction_date = shanghai_time.strftime('%Y-%m-%d')
+                
+                # 追加到主Excel文件
+                logger.info(f"将预测结果追加到主Excel文件: {master_excel_path}")
+                success = updater.append_daily_predictions(next_day_prediction, prediction_date)
+                
+                if success:
+                    logger.info("✓ 增量更新成功")
+                    logger.info(f"✓ 主Excel文件路径: {master_excel_path}")
+                    logger.info(f"✓ 预测日期: {prediction_date}")
+                    logger.info(f"✓ 预测股票数量: {len(next_day_prediction)}")
+                    
+                    # 导出CSV备份
+                    csv_path = os.path.join(save_dir, "predictions_master.csv")
+                    updater.export_to_csv(csv_path)
+                    logger.info(f"✓ CSV备份已保存: {csv_path}")
+                else:
+                    logger.warning("增量更新失败，但详细预测已保存")
+            else:
+                logger.warning("未找到详细预测数据，跳过增量更新")
+            
+            logger.info("\n" + "=" * 60)
+            logger.info("预测流程全部完成")
+            logger.info("=" * 60)
+            return True
+            
         except Exception as e:
             logger.error(f"预测时出错: {str(e)}")
-            # 已在文件顶部导入
             logger.error(traceback.format_exc())
             return False
     
