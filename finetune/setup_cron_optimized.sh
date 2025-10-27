@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAILY_TRAIN_SCRIPT="${SCRIPT_DIR}/daily_train_optimized.sh"
-LOG_DIR="${SCRIPT_DIR}/../logs"
+LOG_DIR="${SCRIPT_DIR}"  # 日志输出到脚本当前目录
 
 # 颜色定义
 RED='\033[0;31m'
