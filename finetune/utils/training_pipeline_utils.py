@@ -52,25 +52,39 @@ def get_shanghai_time():
 
 def get_future_business_days(start_date, num_days):
     """
-    生成未来N个工作日（跳过周末）
+    生成未来N个美股交易日（跳过周末和假期）
     
     Args:
         start_date: 起始日期
-        num_days: 需要生成的工作日数量
+        num_days: 需要生成的交易日数量
         
     Returns:
-        list: 未来N个工作日的日期列表
+        list: 未来N个交易日的日期列表
     """
-    business_days = []
-    current_date = start_date
-    
-    while len(business_days) < num_days:
-        current_date = current_date + timedelta(days=1)
-        # 0-4 代表周一到周五（工作日）
-        if current_date.weekday() < 5:
-            business_days.append(current_date)
-    
-    return business_days
+    try:
+        # 尝试使用美股交易日历
+        from utils.us_trading_calendar import get_future_trading_days
+        
+        # 将 datetime 转换为 date
+        if isinstance(start_date, datetime):
+            start_date = start_date.date()
+        
+        trading_days = get_future_trading_days(start_date, num_days)
+        return trading_days
+        
+    except ImportError:
+        # 如果无法导入，回退到简单的工作日逻辑
+        logger.warning("无法导入美股交易日历，使用简单的工作日逻辑")
+        business_days = []
+        current_date = start_date
+        
+        while len(business_days) < num_days:
+            current_date = current_date + timedelta(days=1)
+            # 0-4 代表周一到周五（工作日）
+            if current_date.weekday() < 5:
+                business_days.append(current_date)
+        
+        return business_days
 
 
 def setup_logging(log_level=logging.INFO, log_dir='./logs'):
@@ -445,13 +459,21 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                 # 生成未来10个工作日的时间戳特征
                 last_date = context_df.iloc[-1]['datetime']
                 future_dates = get_future_business_days(last_date, self.config.predict_window)
+                
+                # 将 date 对象转换为 datetime 对象（设置时间为 00:00:00）
+                from datetime import datetime as dt_datetime
+                future_datetimes = [
+                    dt_datetime.combine(d, dt_datetime.min.time()) if not isinstance(d, dt_datetime) else d 
+                    for d in future_dates
+                ]
+                
                 future_features = pd.DataFrame({
-                    'datetime': future_dates,
-                    'minute': [d.minute for d in future_dates],
-                    'hour': [d.hour for d in future_dates],
-                    'weekday': [d.weekday() for d in future_dates],
-                    'day': [d.day for d in future_dates],
-                    'month': [d.month for d in future_dates]
+                    'datetime': future_datetimes,
+                    'minute': [d.minute for d in future_datetimes],
+                    'hour': [d.hour for d in future_datetimes],
+                    'weekday': [d.weekday() for d in future_datetimes],
+                    'day': [d.day for d in future_datetimes],
+                    'month': [d.month for d in future_datetimes]
                 })
                 
                 # 提取特征

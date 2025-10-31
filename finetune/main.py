@@ -54,6 +54,7 @@ from utils.training_pipeline_utils import (
     update_best_model_paths,
     get_shanghai_time
 )
+from utils.model_loader import load_tokenizer, load_predictor, load_model_from_source
 from common_data_processor import DataProcessorFactory, FinancialDataset
 from prediction_incremental_updater import PredictionIncrementalUpdater
 
@@ -201,6 +202,18 @@ class KronosTrainingPipeline:
             else:
                 logger.info("使用CPU训练，跳过分布式设置")
             return
+        
+        # 检查是否有分布式环境变量，如果没有则禁用DDP
+        if not all(key in os.environ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK']):
+            logger.warning("未检测到分布式训练环境变量（RANK, WORLD_SIZE, LOCAL_RANK），禁用分布式训练，使用单GPU训练")
+            self.use_ddp = False
+            self.rank = 0
+            self.world_size = 1
+            self.local_rank = 0
+            self.device = torch.device("cuda:0")
+            self.is_master = True
+            set_seed(self.config.seed, 0)
+            return
             
         try:
             self.rank, self.world_size, self.local_rank = setup_ddp()
@@ -209,11 +222,20 @@ class KronosTrainingPipeline:
             set_seed(self.config.seed, self.rank)
             logger.info(f"分布式训练环境设置完成 - Rank: {self.rank}, World Size: {self.world_size}")
         except Exception as e:
-            logger.error(f"设置分布式训练环境时出错: {str(e)}")
-            raise
+            logger.warning(f"设置分布式训练环境时出错: {str(e)}")
+            logger.warning("回退到单GPU训练模式")
+            self.use_ddp = False
+            self.rank = 0
+            self.world_size = 1
+            self.local_rank = 0
+            self.device = torch.device("cuda:0")
+            self.is_master = True
+            set_seed(self.config.seed, 0)
     
     def process_data(self):
         """处理数据"""
+        success = True
+        
         if self.is_master:
             logger.info(f"开始处理{self.data_source}数据...")
             try:
@@ -224,11 +246,19 @@ class KronosTrainingPipeline:
                 
                 # 加载测试数据，用于每个训练阶段的评估
                 self.load_test_data()
-                return True
             except Exception as e:
                 logger.error(f"处理数据时出错: {str(e)}")
-                return False
-        return True  # 非主进程直接返回成功
+                success = False
+        
+        # 同步所有进程，确保主进程完成数据处理后其他进程才继续
+        if self.use_ddp:
+            dist.barrier()
+            # 广播主进程的处理结果到所有进程
+            success_tensor = torch.tensor([1.0 if success else 0.0], device=self.device)
+            dist.broadcast(success_tensor, src=0)
+            success = bool(success_tensor.item() > 0.5)
+        
+        return success
         
     def load_test_data(self):
         """加载测试数据，用于模型评估"""
@@ -247,6 +277,30 @@ class KronosTrainingPipeline:
                 logger.error(f"加载测试数据时出错: {str(e)}")
                 self.test_data = None
     
+    def _check_early_stopping_sync(self, early_stopping_counter, patience):
+        """
+        检查并同步提前终止决策（支持分布式训练）
+        
+        Args:
+            early_stopping_counter: 当前的提前终止计数器
+            patience: 耐心值
+            
+        Returns:
+            bool: 是否应该停止训练
+        """
+        should_stop = False
+        
+        if self.is_master:
+            should_stop = (early_stopping_counter >= patience)
+        
+        # 在分布式环境中同步提前终止决策
+        if self.use_ddp:
+            stop_tensor = torch.tensor([1.0 if should_stop else 0.0], device=self.device)
+            dist.broadcast(stop_tensor, src=0)
+            should_stop = bool(stop_tensor.item() > 0.5)
+        
+        return should_stop
+    
     def train_tokenizer(self):
         """训练分词模型"""
         start_time = time.time()
@@ -260,8 +314,16 @@ class KronosTrainingPipeline:
                 if model is None:
                     return False
             else:
-                # 从预训练模型加载
-                model = KronosTokenizer.from_pretrained(self.config.pretrained_tokenizer_path)
+                # 使用新的模型加载器，默认从本地加载，支持智能回退
+                model_source = getattr(self.config, 'model_source', 'local')
+                logger.info(f"从 {model_source} 加载预训练分词模型: {self.config.pretrained_tokenizer_path}")
+                # 如果指定为 'local'，启用智能回退；如果为 'auto'，则自动检测
+                use_fallback = (model_source == 'local')
+                model = load_tokenizer(
+                    self.config.pretrained_tokenizer_path,
+                    source=model_source if model_source != 'auto' else None,
+                    fallback_on_error=use_fallback
+                )
             
             model.to(self.device)
             logger.info(f"分词模型初始化完成 - 大小: {get_model_size(model)}")
@@ -461,15 +523,17 @@ class KronosTrainingPipeline:
                 if self.best_tokenizer_test_loss < float('inf'):
                     if self.best_tokenizer_test_loss >= last_test_loss:
                         early_stopping_counter += 1
-                        logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
+                        if self.is_master:
+                            logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
                     else:
                         early_stopping_counter = 0  # 重置计数器
-                        logger.info(f"测试损失改善，重置提前终止计数器")
+                        if self.is_master:
+                            logger.info(f"测试损失改善，重置提前终止计数器")
                     
                     last_test_loss = self.best_tokenizer_test_loss
                     
-                    # 检查是否需要提前终止
-                    if early_stopping_counter >= self.early_stopping_patience:
+                    # 检查是否需要提前终止（支持分布式同步）
+                    if self._check_early_stopping_sync(early_stopping_counter, self.early_stopping_patience):
                         logger.info(f"提前终止训练：连续 {self.early_stopping_patience} 个epoch测试损失未改善")
                         break
             
@@ -523,7 +587,13 @@ class KronosTrainingPipeline:
         
         # 初始化分词模型和预测模型
         try:
-            tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path, local_files_only=True)
+            # 加载已训练好的分词模型（必须存在，不需要回退）
+            tokenizer = load_tokenizer(
+                self.config.finetuned_tokenizer_path, 
+                source='local', 
+                local_files_only=True,
+                fallback_on_error=False  # 训练好的模型必须存在
+            )
             tokenizer.eval().to(self.device)
             logger.info("分词模型加载完成")
             
@@ -533,8 +603,16 @@ class KronosTrainingPipeline:
                 if model is None:
                     return False
             else:
-                # 从预训练模型加载
-                model = Kronos.from_pretrained(self.config.pretrained_predictor_path)
+                # 使用新的模型加载器，默认从本地加载，支持智能回退
+                model_source = getattr(self.config, 'model_source', 'local')
+                logger.info(f"从 {model_source} 加载预训练预测模型: {self.config.pretrained_predictor_path}")
+                # 如果指定为 'local'，启用智能回退；如果为 'auto'，则自动检测
+                use_fallback = (model_source == 'local')
+                model = load_predictor(
+                    self.config.pretrained_predictor_path,
+                    source=model_source if model_source != 'auto' else None,
+                    fallback_on_error=use_fallback
+                )
             
             model.to(self.device)
             logger.info(f"预测模型初始化完成 - 大小: {get_model_size(model)}")
@@ -735,15 +813,17 @@ class KronosTrainingPipeline:
                 if self.best_predictor_test_loss < float('inf'):
                     if self.best_predictor_test_loss >= last_test_loss:
                         early_stopping_counter += 1
-                        logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
+                        if self.is_master:
+                            logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
                     else:
                         early_stopping_counter = 0  # 重置计数器
-                        logger.info(f"测试损失改善，重置提前终止计数器")
+                        if self.is_master:
+                            logger.info(f"测试损失改善，重置提前终止计数器")
                     
                     last_test_loss = self.best_predictor_test_loss
                     
-                    # 检查是否需要提前终止
-                    if early_stopping_counter >= self.early_stopping_patience:
+                    # 检查是否需要提前终止（支持分布式同步）
+                    if self._check_early_stopping_sync(early_stopping_counter, self.early_stopping_patience):
                         logger.info(f"提前终止训练：连续 {self.early_stopping_patience} 个epoch测试损失未改善")
                         break
             
@@ -866,12 +946,22 @@ class KronosTrainingPipeline:
         logger.info("=" * 60)
         
         try:
-            # 加载最佳模型
+            # 加载最佳模型（训练好的模型，优先从本地加载）
             logger.info("加载最佳模型...")
-            tokenizer = KronosTokenizer.from_pretrained(self.config.finetuned_tokenizer_path, local_files_only=True)
+            tokenizer = load_tokenizer(
+                self.config.finetuned_tokenizer_path, 
+                source='local', 
+                local_files_only=True,
+                fallback_on_error=False  # 训练好的模型必须存在，不需要回退
+            )
             tokenizer.eval().to(self.device)
             
-            model = Kronos.from_pretrained(self.config.finetuned_predictor_path, local_files_only=True)
+            model = load_predictor(
+                self.config.finetuned_predictor_path, 
+                source='local', 
+                local_files_only=True,
+                fallback_on_error=False  # 训练好的模型必须存在，不需要回退
+            )
             model.eval().to(self.device)
             logger.info("✓ 模型加载成功")
             

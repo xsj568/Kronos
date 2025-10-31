@@ -4,10 +4,12 @@ finetune/data/
 finetune/qlib_bin/
 finetune/outputs/
 finetune/model_history/
+finetune/Kronos_models/
 outputs/
 data/processed_datasets/
 qlib_bin/
 model_history/
+Kronos_models/
 
 
 

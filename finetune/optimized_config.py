@@ -125,6 +125,9 @@ class OptimizedConfig:
     
     def _init_model_config(self):
         """初始化模型相关配置"""
+        # 模型来源配置 ('huggingface', 'modelscope', 'local', 'auto')
+        self.model_source = 'local'  # 默认从本地加载，提高加载速度
+        
         # 模型版本配置 - 包含所有预训练模型路径
         self.model_versions = {
             'mini': {
@@ -138,6 +141,19 @@ class OptimizedConfig:
             'base': {
                 'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
                 'predictor': 'NeoQuasar/Kronos-base'
+            },
+            # 本地模型路径 - 对应 finetune/Kronos_models/ 目录
+            'local_mini': {
+                'tokenizer': 'Kronos_models/Kronos-mini/Kronos-Tokenizer-2k',
+                'predictor': 'Kronos_models/Kronos-mini/Kronos-mini'
+            },
+            'local_small': {
+                'tokenizer': 'Kronos_models/Kronos-small/Kronos-Tokenizer-base',
+                'predictor': 'Kronos_models/Kronos-small/Kronos-small'
+            },
+            'local_base': {
+                'tokenizer': 'Kronos_models/Kronos-base/Kronos-Tokenizer-base',
+                'predictor': 'Kronos_models/Kronos-base/Kronos-base'
             },
             'customer': {
                 'tokenizer': None,  # 从配置文件读取
@@ -157,6 +173,12 @@ class OptimizedConfig:
             else:
                 self.pretrained_tokenizer_path = self.model_versions[self.model_version]['tokenizer']
                 self.pretrained_predictor_path = self.model_versions[self.model_version]['predictor']
+                
+                # 如果是本地模型版本，自动设置 model_source 为 'local'（如果还未指定）
+                if self.model_version.startswith('local_'):
+                    if self.model_source in ('auto', None):
+                        self.model_source = 'local'
+                        logger.info(f"检测到本地模型版本 '{self.model_version}'，自动设置 model_source='local'")
         else:
             raise ValueError(f"不支持的模型版本: {self.model_version}")
     
@@ -247,11 +269,11 @@ class OptimizedConfig:
         self.use_comet = False
         self.comet_config = {
             "api_key": "YOUR_COMET_API_KEY",
-            "project_name": "Kronos-Finetune-Demo",
+            "project_name": "Kronos-Finetune",
             "workspace": "your_comet_workspace"
         }
-        self.comet_tag = 'finetune_demo'
-        self.comet_name = 'finetune_demo'
+        self.comet_tag = 'finetune'
+        self.comet_name = 'finetune'
     
     def _init_backtest_config(self):
         """初始化回测相关配置"""
@@ -460,12 +482,16 @@ class OptimizedConfig:
 def parse_args():
     """解析命令行参数 - 完全独立，不依赖外部"""
     parser = argparse.ArgumentParser(description='Kronos模型训练流水线')
-    parser.add_argument('--cpu', action='store_true', default=False, help='使用CPU训练')
+    parser.add_argument('--cpu', action='store_true', default=True, help='使用CPU训练')
     parser.add_argument('--data-source', type=str, default='sina', choices=['qlib', 'sina'], help='数据源类型')
     parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
     parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')
-    parser.add_argument('--model-version', type=str, default='base', choices=['mini', 'small', 'base', 'customer'],
-                        help='模型版本: mini(小), small(中), base(大), customer(自定义配置)')
+    parser.add_argument('--model-version', type=str, default='base', 
+                        choices=['mini', 'small', 'base', 'local_mini', 'local_small', 'local_base', 'customer'],
+                        help='模型版本: mini(小), small(中), base(大), local_mini/local_small/local_base(本地模型), customer(自定义配置)')
+    parser.add_argument('--model-source', type=str, default='local', 
+                        choices=['auto', 'huggingface', 'modelscope', 'local'],
+                        help='模型来源: local(本地,默认), auto(自动检测), huggingface(Hugging Face), modelscope(魔搭社区)')
     parser.add_argument('--custom-tokenizer-config', type=str, default='custom_tokenizer_config.json',
                         help='自定义tokenizer配置文件路径')
     parser.add_argument('--custom-predictor-config', type=str, default='custom_predictor_config.json',
@@ -493,7 +519,8 @@ def create_config_from_args(args) -> OptimizedConfig:
         force_download_data=args.force_download,
         custom_tokenizer_config=args.custom_tokenizer_config,
         custom_predictor_config=args.custom_predictor_config,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        model_source=args.model_source
     )
     
     return config
@@ -518,13 +545,24 @@ def create_config_interactive():
     
     # 模型版本选择
     logger.info("\n2. 选择模型版本:")
-    logger.info("   a) mini (小模型)")
-    logger.info("   b) small (中等模型)")
-    logger.info("   c) base (大模型)")
-    logger.info("   d) customer (自定义配置)")
-    model_choice = input("请选择 (a/b/c/d) [默认: c]: ").strip().lower()
-    model_version_map = {'a': 'mini', 'b': 'small', 'c': 'base', 'd': 'customer'}
-    model_version = model_version_map.get(model_choice, 'base')
+    logger.info("   a) mini (小模型 - Hugging Face)")
+    logger.info("   b) small (中等模型 - Hugging Face)")
+    logger.info("   c) base (大模型 - Hugging Face)")
+    logger.info("   d) local_mini (小模型 - 本地)")
+    logger.info("   e) local_small (中等模型 - 本地)")
+    logger.info("   f) local_base (大模型 - 本地)")
+    logger.info("   g) customer (自定义配置)")
+    model_choice = input("请选择 (a/b/c/d/e/f/g) [默认: f]: ").strip().lower()
+    model_version_map = {
+        'a': 'mini', 
+        'b': 'small', 
+        'c': 'base', 
+        'd': 'local_mini', 
+        'e': 'local_small', 
+        'f': 'local_base', 
+        'g': 'customer'
+    }
+    model_version = model_version_map.get(model_choice, 'local_base')
     logger.info(f"选择模型版本: {model_version}")
     
     # 如果是customer版本，需要输入配置文件路径

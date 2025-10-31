@@ -22,9 +22,9 @@ LOG_FILE="${LOG_DIR}/daily_train_${TODAY}.log"
 # mkdir -p "$LOG_DIR"  # 当前目录已存在，无需创建
 
 # Python环境配置 - 使用kronos conda环境
-PYTHON_CMD="/root/anaconda3/envs/kronos/bin/python"
+PYTHON_CMD="/root/autodl-tmp/miniconda3/envs/kronos/bin/python"
 # 如果需要激活conda环境，也可以使用以下方式
-# source /root/anaconda3/bin/activate kronos
+# source /root/autodl-tmp/miniconda3/bin/activate kronos
 
 # 训练配置
 DATA_SOURCE="sina"           # 数据源：sina（新浪美股）或qlib
