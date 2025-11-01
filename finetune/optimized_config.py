@@ -119,9 +119,17 @@ class OptimizedConfig:
         
         # 数据源特定配置
         if self.data_source == 'sina':
-            self.max_sina_symbols = 10000
+            # 限制股票数量（建议100-5000支，None表示使用全部）
+            # 注意：CSV文件中只能用symbol列，其他数据（市值、成交量等）已过时
+            # 筛选时会通过实时API采样最新数据
+            self.max_sina_symbols = 3000  # 默认3000支，通过实时数据筛选活跃股票
+            
+            # 实时采样天数（用于筛选活跃股票）
+            # 系统会采样最近N天的交易数据，根据成交量和数据完整性评分
+            self.sampling_days = 30  # 默认最近一个月
         else:  # qlib
             self.max_sina_symbols = None
+            self.sampling_days = 5
     
     def _init_model_config(self):
         """初始化模型相关配置"""

@@ -1645,6 +1645,33 @@ def compare_and_select_best_model(model_type, config, test_data, device, history
         return None, float('inf'), {}
 
 
+def _should_load_remote(model_path, config):
+    """
+    判断模型是否应该从远程加载
+    
+    Args:
+        model_path: 模型路径
+        config: 配置对象
+        
+    Returns:
+        bool: True表示从远程加载，False表示从本地加载
+    """
+    # 如果配置明确指定从本地加载，则不从远程加载
+    if hasattr(config, 'model_source') and config.model_source == 'local':
+        return False
+    
+    # 如果路径是本地存在的目录，从本地加载
+    if os.path.exists(model_path):
+        return False
+    
+    # 如果路径格式类似 HuggingFace (xxx/yyy) 且不存在本地，从远程加载
+    if '/' in model_path and not model_path.startswith(('./', '/', '~')):
+        return True
+    
+    # 默认从本地加载
+    return False
+
+
 def evaluate_models_during_training(epoch_idx, current_model_path, config, test_data, device, model_type, best_loss, save_path):
     """
     在训练过程中评估模型并选择最佳模型
@@ -1711,12 +1738,12 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
             models_to_evaluate = {}
             
             if model_type == 'tokenizer':
-                # 添加基础模型（远程模型）- 只有当预训练路径存在时才添加
+                # 添加基础模型 - 只有当预训练路径存在时才添加
                 base_path = config.pretrained_tokenizer_path
                 if base_path is not None:
                     models_to_evaluate['base'] = {
                         'path': base_path,
-                        'is_remote': True  # 基础模型从远程加载
+                        'is_remote': _should_load_remote(base_path, config)  # 根据配置和路径判断
                     }
                 
                 # 添加历史最佳模型（如果存在且不同于基础模型）
@@ -1797,12 +1824,12 @@ def evaluate_models_during_training(epoch_idx, current_model_path, config, test_
             else:  # predictor
                 tokenizer_path = config.finetuned_tokenizer_path
                 
-                # 添加基础模型（远程模型）- 只有当预训练路径存在时才添加
+                # 添加基础模型 - 只有当预训练路径存在时才添加
                 base_path = config.pretrained_predictor_path
                 if base_path is not None:
                     models_to_evaluate['base'] = {
                         'path': base_path,
-                        'is_remote': True  # 基础模型从远程加载
+                        'is_remote': _should_load_remote(base_path, config)  # 根据配置和路径判断
                     }
                 
                 # 添加历史最佳模型（如果存在且不同于基础模型）

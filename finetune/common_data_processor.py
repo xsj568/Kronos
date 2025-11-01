@@ -130,9 +130,77 @@ class SinaDataProcessor(BaseDataProcessor):
         self.data_fields = ['open', 'close', 'high', 'low', 'volume']
         self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
     
+    def _filter_symbols_by_sampling(self, symbols, target_count, sample_days=None):
+        """
+        通过采样最近几天数据来筛选活跃股票（方案2）
+        
+        Args:
+            symbols: 待筛选的股票列表
+            target_count: 目标股票数量
+            sample_days: 采样天数，None则从配置读取
+            
+        Returns:
+            list: 筛选后的股票列表
+        """
+        # 从配置读取采样天数
+        if sample_days is None:
+            sample_days = getattr(self.config, 'sampling_days', 30)
+        
+        logger.info(f"开始采样筛选：从{len(symbols)}支股票中选择{target_count}支活跃股票...")
+        logger.info(f"采样最近{sample_days}天的数据进行筛选")
+        
+        stock_scores = {}
+        checked_count = 0
+        
+        # 随机打乱顺序，避免总是检查前面的股票
+        random.shuffle(symbols)
+        
+        # 限制检查的股票数量（最多检查target_count的3倍）
+        symbols_to_check = symbols[:min(len(symbols), target_count * 3)]
+        
+        for symbol in symbols_to_check:
+            try:
+                url = self.url_base % symbol
+                response = requests.get(url, timeout=5)
+                
+                if response.status_code == 200 and response.text:
+                    data = json.loads(response.text)
+                    
+                    if data and len(data) >= sample_days:
+                        # 计算最近几天的平均成交量
+                        recent_data = data[-sample_days:]
+                        volumes = [float(d['volume']) for d in recent_data if 'volume' in d]
+                        
+                        if volumes:
+                            avg_volume = sum(volumes) / len(volumes)
+                            # 分数 = 平均成交量 + 数据完整性奖励
+                            score = avg_volume * (1 + len(volumes) / sample_days)
+                            stock_scores[symbol] = score
+                            
+                checked_count += 1
+                if checked_count % 50 == 0:
+                    logger.info(f"已检查 {checked_count}/{len(symbols_to_check)} 支股票，找到 {len(stock_scores)} 支有效股票")
+                    
+            except Exception as e:
+                continue
+        
+        # 按分数排序，选择前target_count支
+        sorted_stocks = sorted(stock_scores.items(), key=lambda x: x[1], reverse=True)
+        selected_symbols = [s[0] for s in sorted_stocks[:target_count]]
+        
+        logger.info(f"筛选完成：从{len(symbols)}支中选出{len(selected_symbols)}支活跃股票")
+        return selected_symbols
+    
     def _load_symbols_from_csv(self):
         """
         从stock_code_US.csv文件中加载股票代码列表
+        
+        注意：CSV文件中的数据（市值、成交量等）是过时的，严禁使用！
+        仅使用CSV中的symbol列获取股票代码。
+        
+        筛选方案：
+        - 如果不限制数量：返回所有股票代码
+        - 如果限制数量：通过实时API采样筛选活跃股票
         
         Returns:
             list: 股票代码列表
@@ -144,7 +212,7 @@ class SinaDataProcessor(BaseDataProcessor):
             return self._get_default_symbols()
         
         try:
-            # 读取CSV文件
+            # 读取CSV文件 - 只使用symbol列，其他数据都是过时的
             df = pd.read_csv(csv_path)
             
             # 检查必要的列是否存在
@@ -152,34 +220,50 @@ class SinaDataProcessor(BaseDataProcessor):
                 logger.error("CSV文件中缺少'symbol'列")
                 return self._get_default_symbols()
             
-            # 获取配置中的过滤条件
-            filters = getattr(self.config, 'sina_symbol_filters', {})
+            # 只提取symbol列，过滤掉无效的股票代码
+            df = df[df['symbol'].notna()]
+            df = df[df['symbol'].apply(lambda x: isinstance(x, str) and len(x) > 0 and not x.startswith('-'))]
             
-            # 应用过滤条件
-            filtered_df = df.copy()
-
-            # 限制股票数量
+            # 获取所有有效的股票代码
+            all_symbols = df['symbol'].tolist()
+            logger.info(f"从CSV文件读取到 {len(all_symbols)} 支股票代码")
+            
+            # 获取配置
             max_symbols = getattr(self.config, 'max_sina_symbols', None)
-            if max_symbols and len(filtered_df) > max_symbols:
-                # 随机选择指定数量的股票
-                filtered_df = filtered_df.sample(n=max_symbols, random_state=42)
-                logger.info(f"随机选择 {max_symbols} 支股票")
             
-            # 提取股票代码
-            symbols = filtered_df['symbol'].dropna().tolist()
+            # 如果不限制数量，直接返回所有股票
+            if max_symbols is None:
+                logger.info(f"不限制股票数量，使用全部 {len(all_symbols)} 支股票")
+                return all_symbols
             
-            # 过滤掉无效的股票代码
-            symbols = [s for s in symbols if isinstance(s, str) and len(s) > 0 and not s.startswith('-')]
+            # 如果CSV中的股票数量已经少于或等于目标数量，直接返回
+            if len(all_symbols) <= max_symbols:
+                logger.info(f"CSV中股票数量({len(all_symbols)})未超过限制({max_symbols})，使用全部股票")
+                return all_symbols
             
-            if not symbols:
-                logger.warning("过滤后没有有效的股票代码，使用默认列表")
-                return self._get_default_symbols()
+            # 需要筛选：通过实时API采样筛选活跃股票
+            logger.info(f"需要从{len(all_symbols)}支股票中筛选出{max_symbols}支活跃股票")
+            logger.info("注意：CSV文件数据已过时，将通过实时API采样最新数据进行筛选")
             
-            logger.info(f"从CSV文件加载了 {len(symbols)} 支股票代码")
-            return symbols
+            selected_symbols = self._filter_symbols_by_sampling(all_symbols, max_symbols)
+            
+            # 如果筛选结果太少（可能因为网络问题或API限制），随机补充
+            if len(selected_symbols) < max_symbols // 2:
+                logger.warning(f"实时筛选结果不足（{len(selected_symbols)}支），使用随机选择补充")
+                remaining_symbols = [s for s in all_symbols if s not in selected_symbols]
+                random.shuffle(remaining_symbols)
+                additional_count = max_symbols - len(selected_symbols)
+                additional = remaining_symbols[:additional_count]
+                selected_symbols.extend(additional)
+                logger.info(f"随机补充了 {len(additional)} 支股票")
+            
+            logger.info(f"最终筛选出 {len(selected_symbols)} 支股票用于训练")
+            return selected_symbols
             
         except Exception as e:
-            logger.error(f"读取CSV文件失败: {str(e)}，使用默认股票代码列表")
+            logger.error(f"加载股票代码失败: {str(e)}，使用默认股票代码列表")
+            import traceback
+            logger.error(traceback.format_exc())
             return self._get_default_symbols()
     
     def _get_default_symbols(self):
