@@ -84,6 +84,7 @@ class KronosTrainingPipeline:
         self.rank = 0
         self.world_size = 1
         self.local_rank = 0
+        
         # 支持 Mac M4 MPS 和 NVIDIA CUDA
         if use_gpu:
             if torch.cuda.is_available():
@@ -98,13 +99,22 @@ class KronosTrainingPipeline:
         else:
             self.device = torch.device("cpu")
             self.gpu_type = "cpu"
+            
+        # CPU多核优化：设置PyTorch线程数
+        if self.gpu_type == "cpu" and hasattr(config, 'torch_threads') and config.torch_threads > 0:
+            torch.set_num_threads(config.torch_threads)
+            torch.set_num_interop_threads(config.torch_threads)
+            logger.info(f"设置PyTorch线程数: {config.torch_threads}")
+        
         self.is_master = True  # 单进程或主进程
         
         # 设置分布式训练标志，避免重复检查
         self.use_ddp = (use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1)
         
-        # 初始化日志
-        setup_logging()
+        # 初始化日志（包含股票数量信息）
+        top_k = getattr(config, 'top_k_stocks', None)
+        model_ver = getattr(config, 'model_version', None)
+        setup_logging(top_k_stocks=top_k, data_source=data_source, model_version=model_ver)
         logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}")
         
         # 设置保存路径，使用config中定义的路径
@@ -327,6 +337,15 @@ class KronosTrainingPipeline:
             
             model.to(self.device)
             logger.info(f"分词模型初始化完成 - 大小: {get_model_size(model)}")
+            
+            # CPU优化：使用torch.compile()加速（如果启用）
+            if hasattr(self.config, 'use_torch_compile') and self.config.use_torch_compile:
+                if hasattr(torch, 'compile'):
+                    compile_mode = getattr(self.config, 'torch_compile_mode', 'default')
+                    logger.info(f"启用torch.compile()加速 - 模式: {compile_mode}")
+                    model = torch.compile(model, mode=compile_mode)
+                else:
+                    logger.warning("当前PyTorch版本不支持torch.compile()，跳过编译")
         except Exception as e:
             logger.error(f"初始化分词模型时出错: {str(e)}")
             return False
@@ -496,10 +515,16 @@ class KronosTrainingPipeline:
                         save_path=self.config.finetuned_tokenizer_path
                     )
                     
-                    # 清理临时模型文件
-                    #shutil.rmtree(temp_save_path, ignore_errors=True)
                     # 记录评估信息
                     evaluation_history.append(eval_info)
+                    
+                    # 清理临时模型文件（节省磁盘空间）
+                    # 只保留最佳模型，删除当前epoch的临时检查点
+                    try:
+                        shutil.rmtree(temp_save_path, ignore_errors=True)
+                        logger.info(f"已清理临时检查点: {temp_save_path}")
+                    except Exception as e:
+                        logger.warning(f"清理临时文件失败: {e}")
                     
                     # 记录到Comet（如果启用）
                     if comet_logger and os.path.exists(self.config.finetuned_tokenizer_path):
@@ -608,14 +633,26 @@ class KronosTrainingPipeline:
                 logger.info(f"从 {model_source} 加载预训练预测模型: {self.config.pretrained_predictor_path}")
                 # 如果指定为 'local'，启用智能回退；如果为 'auto'，则自动检测
                 use_fallback = (model_source == 'local')
+                # 修复：local_files_only应该与model_source对应
+                local_files_only = (model_source == 'local')
                 model = load_predictor(
                     self.config.pretrained_predictor_path,
                     source=model_source if model_source != 'auto' else None,
-                    fallback_on_error=use_fallback
+                    fallback_on_error=use_fallback,
+                    local_files_only=local_files_only
                 )
             
             model.to(self.device)
             logger.info(f"预测模型初始化完成 - 大小: {get_model_size(model)}")
+            
+            # CPU优化：使用torch.compile()加速（如果启用）
+            if hasattr(self.config, 'use_torch_compile') and self.config.use_torch_compile:
+                if hasattr(torch, 'compile'):
+                    compile_mode = getattr(self.config, 'torch_compile_mode', 'default')
+                    logger.info(f"启用torch.compile()加速 - 模式: {compile_mode}")
+                    model = torch.compile(model, mode=compile_mode)
+                else:
+                    logger.warning("当前PyTorch版本不支持torch.compile()，跳过编译")
         except Exception as e:
             logger.error(f"初始化模型时出错: {str(e)}")
             return False
@@ -786,10 +823,16 @@ class KronosTrainingPipeline:
                         save_path=self.config.finetuned_predictor_path
                     )
                     
-                    # 清理临时模型文件
-                    #shutil.rmtree(temp_save_path, ignore_errors=True)
                     # 记录评估信息
                     evaluation_history.append(eval_info)
+                    
+                    # 清理临时模型文件（节省磁盘空间）
+                    # 只保留最佳模型，删除当前epoch的临时检查点
+                    try:
+                        shutil.rmtree(temp_save_path, ignore_errors=True)
+                        logger.info(f"已清理临时检查点: {temp_save_path}")
+                    except Exception as e:
+                        logger.warning(f"清理临时文件失败: {e}")
                     
                     # 记录到Comet（如果启用）
                     if comet_logger and os.path.exists(self.config.finetuned_predictor_path):

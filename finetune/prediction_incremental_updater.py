@@ -50,24 +50,30 @@ class PredictionIncrementalUpdater:
         if not os.path.exists(self.master_excel_path):
             # 创建空的DataFrame并保存
             df = pd.DataFrame(columns=[
-                '预测日期',
+                '生成日期',  # 何时生成的预测
+                '目标日期',  # 预测的是哪一天
                 '股票代码',
-                '当前开盘价',
-                '当前最高价',
-                '当前最低价',
-                '当前收盘价',
-                '当前成交量',
-                '预测日期',
+                # 预测值
                 '预测开盘价',
                 '预测最高价',
                 '预测最低价',
                 '预测收盘价',
                 '预测成交量',
-                '开盘价涨跌幅(%)',
-                '最高价涨跌幅(%)',
-                '最低价涨跌幅(%)',
-                '收盘价涨跌幅(%)',
-                '成交量涨跌幅(%)'
+                # 真实值（初始为空，下次训练时回填）
+                '真实开盘价',
+                '真实最高价',
+                '真实最低价',
+                '真实收盘价',
+                '真实成交量',
+                # 预测涨跌幅
+                '预测开盘涨跌幅(%)',
+                '预测最高涨跌幅(%)',
+                '预测最低涨跌幅(%)',
+                '预测收盘涨跌幅(%)',
+                '预测成交量涨跌幅(%)',
+                # 预测准确性（下次计算）
+                '开盘价误差(%)',
+                '收盘价误差(%)'
             ])
             
             try:
@@ -101,11 +107,11 @@ class PredictionIncrementalUpdater:
                 logger.warning(f"读取现有Excel数据失败，将创建新文件: {str(e)}")
                 existing_df = pd.DataFrame()
             
-            # 检查是否已经有今天的预测
-            if not existing_df.empty and '预测日期' in existing_df.columns:
-                # 删除今天的旧预测（如果存在）
-                existing_df = existing_df[existing_df['预测日期'] != prediction_date]
-                logger.info(f"删除已存在的 {prediction_date} 预测数据")
+            # 检查是否已经有今天生成的预测
+            if not existing_df.empty and '生成日期' in existing_df.columns:
+                # 删除今天生成的旧预测（如果存在）
+                existing_df = existing_df[existing_df['生成日期'] != prediction_date]
+                logger.info(f"删除已存在的 {prediction_date} 生成的预测数据")
             
             # 准备新的预测数据
             # 假设 prediction_data 包含详细的预测信息
@@ -113,24 +119,30 @@ class PredictionIncrementalUpdater:
             
             for _, row in prediction_data.iterrows():
                 record = {
-                    '预测日期': prediction_date,
+                    '生成日期': prediction_date,  # 预测生成日期
+                    '目标日期': row.get('day_1_date', ''),  # 预测目标日期
                     '股票代码': row.get('stock_code', ''),
-                    '当前开盘价': row.get('current_open', 0),
-                    '当前最高价': row.get('current_high', 0),
-                    '当前最低价': row.get('current_low', 0),
-                    '当前收盘价': row.get('current_close', 0),
-                    '当前成交量': row.get('current_volume', 0),
-                    '预测日期': row.get('day_1_date', ''),
+                    # 预测值
                     '预测开盘价': row.get('day_1_open', 0),
                     '预测最高价': row.get('day_1_high', 0),
                     '预测最低价': row.get('day_1_low', 0),
                     '预测收盘价': row.get('day_1_close', 0),
                     '预测成交量': row.get('day_1_volume', 0),
-                    '开盘价涨跌幅(%)': row.get('day_1_open_change_pct', 0),
-                    '最高价涨跌幅(%)': row.get('day_1_high_change_pct', 0),
-                    '最低价涨跌幅(%)': row.get('day_1_low_change_pct', 0),
-                    '收盘价涨跌幅(%)': row.get('day_1_close_change_pct', 0),
-                    '成交量涨跌幅(%)': row.get('day_1_volume_change_pct', 0)
+                    # 真实值（初始为空，等下次训练时回填）
+                    '真实开盘价': None,
+                    '真实最高价': None,
+                    '真实最低价': None,
+                    '真实收盘价': None,
+                    '真实成交量': None,
+                    # 预测涨跌幅
+                    '预测开盘涨跌幅(%)': row.get('day_1_open_change_pct', 0),
+                    '预测最高涨跌幅(%)': row.get('day_1_high_change_pct', 0),
+                    '预测最低涨跌幅(%)': row.get('day_1_low_change_pct', 0),
+                    '预测收盘涨跌幅(%)': row.get('day_1_close_change_pct', 0),
+                    '预测成交量涨跌幅(%)': row.get('day_1_volume_change_pct', 0),
+                    # 预测准确性（初始为空）
+                    '开盘价误差(%)': None,
+                    '收盘价误差(%)': None
                 }
                 new_records.append(record)
             
@@ -140,8 +152,9 @@ class PredictionIncrementalUpdater:
             # 合并数据
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
             
-            # 按预测日期降序排列（最新的在前面）
-            combined_df = combined_df.sort_values('预测日期', ascending=False).reset_index(drop=True)
+            # 按生成日期和目标日期降序排列（最新的在前面）
+            if not combined_df.empty:
+                combined_df = combined_df.sort_values(['生成日期', '目标日期'], ascending=False).reset_index(drop=True)
             
             # 保存到Excel
             with pd.ExcelWriter(self.master_excel_path, engine='openpyxl') as writer:
@@ -171,23 +184,24 @@ class PredictionIncrementalUpdater:
             if data_df.empty:
                 return
             
-            # 按日期统计
-            summary_by_date = data_df.groupby('预测日期').agg({
-                '股票代码': 'count',
-                '收盘价涨跌幅(%)': ['mean', 'std', 'min', 'max']
-            }).reset_index()
-            
-            summary_by_date.columns = [
-                '预测日期',
-                '股票数量',
-                '平均涨跌幅(%)',
-                '涨跌幅标准差',
-                '最小涨跌幅(%)',
-                '最大涨跌幅(%)'
-            ]
-            
-            summary_by_date.to_excel(writer, sheet_name='日期摘要', index=False)
-            logger.info("✓ 创建日期摘要表")
+            # 按目标日期统计
+            if '目标日期' in data_df.columns:
+                summary_by_date = data_df.groupby('目标日期').agg({
+                    '股票代码': 'count',
+                    '预测收盘涨跌幅(%)': ['mean', 'std', 'min', 'max']
+                }).reset_index()
+                
+                summary_by_date.columns = [
+                    '目标日期',
+                    '股票数量',
+                    '平均预测涨跌幅(%)',
+                    '涨跌幅标准差',
+                    '最小涨跌幅(%)',
+                    '最大涨跌幅(%)'
+                ]
+                
+                summary_by_date.to_excel(writer, sheet_name='日期摘要', index=False)
+                logger.info("✓ 创建日期摘要表")
         
         except Exception as e:
             logger.warning(f"创建摘要表失败: {str(e)}")

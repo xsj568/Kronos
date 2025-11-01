@@ -75,7 +75,7 @@ case $choice in
         fi
         
         # 创建新的crontab
-        cron_entry="$minute $hour * * * cd $SCRIPT_DIR && $DAILY_TRAIN_SCRIPT >> $LOG_DIR/cron.log 2>&1"
+        cron_entry="$minute $hour * * * cd $SCRIPT_DIR && $DAILY_TRAIN_SCRIPT >> $LOG_DIR/cron_\$(date +\\%Y\\%m\\%d).log 2>&1"
         
         # 删除旧的Kronos任务
         (crontab -l 2>/dev/null | grep -v "daily_train" | grep -v "Kronos" || true) | crontab -
@@ -89,7 +89,7 @@ case $choice in
         echo "任务详情:"
         echo "  执行时间: 每天 $hour:$(printf "%02d" $minute)"
         echo "  脚本路径: $DAILY_TRAIN_SCRIPT"
-        echo "  日志文件: $LOG_DIR/cron.log"
+        echo "  日志文件: $LOG_DIR/cron_YYYYMMDD.log"
         echo ""
         echo "更新后的定时任务："
         echo "----------------------------"
@@ -134,7 +134,8 @@ echo "提示："
 echo "  - 手动运行训练: $DAILY_TRAIN_SCRIPT"
 echo "  - 查看定时任务: crontab -l"
 echo "  - 编辑定时任务: crontab -e"
-echo "  - 查看训练日志: tail -f $LOG_DIR/daily_train_*.log"
-echo "  - 查看cron日志: tail -f $LOG_DIR/cron.log"
+echo "  - 查看训练日志: tail -f $LOG_DIR/training_\$(date +%Y%m%d)*.log"
+echo "  - 查看cron日志: tail -f $LOG_DIR/cron_\$(date +%Y%m%d).log"
+echo "  - 列出所有日志: ls -lht $LOG_DIR/training_*.log | head"
 echo "=================================================="
 

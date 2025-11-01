@@ -43,7 +43,7 @@ class OptimizedConfig:
     
     def __init__(self, 
                  data_source: str = 'sina',
-                 model_version: str = 'base',
+                 model_version: str = 'local_base',  # 默认使用本地base模型
                  use_gpu: bool = True,
                  config_file: Optional[str] = None,
                  **kwargs):
@@ -66,16 +66,18 @@ class OptimizedConfig:
         self._init_data_config()
         self._init_model_config()
         self._init_training_config()
-        self._init_paths_config()
-        self._init_logging_config()
-        self._init_backtest_config()
         
         # 从外部文件加载配置（如果提供）
         if config_file:
             self.load_from_file(config_file)
         
-        # 应用额外参数
+        # 应用额外参数（需要在路径初始化之前，因为路径依赖top_k_stocks）
         self._apply_kwargs(kwargs)
+        
+        # 初始化路径（依赖top_k_stocks等参数）
+        self._init_paths_config()
+        self._init_logging_config()
+        self._init_backtest_config()
         
         # 最终配置验证和路径设置
         self._finalize_config()
@@ -246,11 +248,24 @@ class OptimizedConfig:
         
         # 提前终止配置
         self.early_stopping_patience = 6
+        
+        # CPU多核优化配置
+        self.num_workers = 0  # DataLoader的worker数量，默认0，使用CPU时建议设置为4-16
+        self.torch_threads = 0  # PyTorch计算线程数，默认0表示自动，建议设置为物理核心数
+        self.use_torch_compile = False  # 是否使用torch.compile()加速（PyTorch 2.0+）
+        self.torch_compile_mode = 'default'  # torch.compile模式: 'default', 'reduce-overhead', 'max-autotune'
+        
+        # 股票选择配置
+        self.top_k_stocks = 3000  # 选择TopK活跃股票数量，默认3000
+        self.stock_selection_days = 365  # 基于最近N天的数据选择股票，默认365天（一年）
+        self.stock_cache_file = None  # 股票代码缓存文件名（自动根据top_k生成: selected_stocks_{top_k}.json）
+        self.use_stock_cache = True  # 是否使用缓存的股票列表（True: 从缓存读取, False: 重新选择）
     
     def _init_paths_config(self):
         """初始化路径相关配置"""
-        # 基础保存路径
-        self.save_path = f"./outputs/{self.data_source}/{self.model_version}"
+        # 基础保存路径（包含股票数量后缀，避免不同数量的结果互相覆盖）
+        stock_suffix = f"_k{self.top_k_stocks}"
+        self.save_path = f"./outputs/{self.data_source}/{self.model_version}{stock_suffix}"
         
         # 模型保存文件夹名称
         self.tokenizer_save_folder_name = 'finetune_tokenizer'
@@ -506,6 +521,26 @@ def parse_args():
                         help='自定义predictor配置文件路径')
     parser.add_argument('--early-stopping-patience', type=int, default=8,
                         help='提前终止的耐心值（连续多少个epoch测试损失没有提升就停止）')
+    
+    # CPU多核优化参数
+    parser.add_argument('--num-workers', type=int, default=16,
+                        help='DataLoader的worker进程数，建议设置为4-24（默认16）')
+    parser.add_argument('--torch-threads', type=int, default=28,
+                        help='PyTorch计算线程数，建议设置为物理核心数（默认28）')
+    parser.add_argument('--use-torch-compile', action='store_true', default=False,
+                        help='启用torch.compile()加速（PyTorch 2.0+，实验性功能）')
+    parser.add_argument('--torch-compile-mode', type=str, default='default',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile()模式（default: 平衡, reduce-overhead: 减少开销, max-autotune: 最大优化）')
+    
+    # 股票选择参数
+    parser.add_argument('--top-k-stocks', type=int, default=3000,
+                        help='选择TopK活跃股票数量（默认3000）')
+    parser.add_argument('--stock-selection-days', type=int, default=365,
+                        help='基于最近N天的数据选择股票（默认365天）')
+    parser.add_argument('--no-stock-cache', action='store_true', default=False,
+                        help='不使用缓存的股票列表，强制重新选择（默认使用缓存）')
+    
     return parser.parse_args()
 
 
@@ -528,7 +563,16 @@ def create_config_from_args(args) -> OptimizedConfig:
         custom_tokenizer_config=args.custom_tokenizer_config,
         custom_predictor_config=args.custom_predictor_config,
         early_stopping_patience=args.early_stopping_patience,
-        model_source=args.model_source
+        model_source=args.model_source,
+        # CPU多核优化参数
+        num_workers=args.num_workers,
+        torch_threads=args.torch_threads,
+        use_torch_compile=args.use_torch_compile,
+        torch_compile_mode=args.torch_compile_mode,
+        # 股票选择参数
+        top_k_stocks=args.top_k_stocks,
+        stock_selection_days=args.stock_selection_days,
+        use_stock_cache=not args.no_stock_cache
     )
     
     return config

@@ -87,13 +87,16 @@ def get_future_business_days(start_date, num_days):
         return business_days
 
 
-def setup_logging(log_level=logging.INFO, log_dir='./logs'):
+def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, data_source=None, model_version=None):
     """
-    设置日志配置，使用上海时区，保存到文件（带日期后缀）
+    设置日志配置，使用上海时区，保存到文件（带日期和股票数量后缀）
     
     Args:
         log_level: 日志级别
         log_dir: 日志保存目录
+        top_k_stocks: 股票池数量（可选，如果提供则加入文件名）
+        data_source: 数据源（可选）
+        model_version: 模型版本（可选）
     """
     import pytz
     
@@ -108,9 +111,20 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs'):
     # 创建日志目录
     os.makedirs(log_dir, exist_ok=True)
     
-    # 生成带日期后缀的日志文件名（使用上海时间）
+    # 生成带日期和股票数量后缀的日志文件名（使用上海时间）
     current_time = datetime.now(shanghai_tz)
-    log_filename = current_time.strftime('training_%Y%m%d.log')
+    date_str = current_time.strftime('%Y%m%d')
+    
+    # 构建文件名：training_20251101_sina_base_k3000.log
+    filename_parts = ['training', date_str]
+    if data_source:
+        filename_parts.append(data_source)
+    if model_version:
+        filename_parts.append(model_version)
+    if top_k_stocks:
+        filename_parts.append(f'k{top_k_stocks}')
+    
+    log_filename = '_'.join(filename_parts) + '.log'
     log_filepath = os.path.join(log_dir, log_filename)
     
     # 自定义日志格式化器，使用上海时间

@@ -17,7 +17,7 @@ from torch.utils.data import Dataset
 
 # 添加项目路径
 sys.path.append("../")
-from config import Config
+from optimized_config import OptimizedConfig as Config
 
 # 全局logger
 logger = logging.getLogger('KronosPipeline')
@@ -123,31 +123,140 @@ class SinaDataProcessor(BaseDataProcessor):
         super().__init__(config)
         self.url_base = "http://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol=%s&___qn=3n"
         
-        # 加载股票代码列表
-        self.symbols = self._load_symbols_from_csv()
+        # 加载股票代码列表（支持缓存）
+        self.symbols = self._load_or_select_stocks()
         logger.info(f"使用{len(self.symbols)}支股票进行训练: {self.symbols[:5]}... 等")
         
         self.data_fields = ['open', 'close', 'high', 'low', 'volume']
         self.feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
     
-    def _filter_symbols_by_sampling(self, symbols, target_count, sample_days=None):
+    def _load_or_select_stocks(self):
         """
-        通过采样最近几天数据来筛选活跃股票（方案2）
+        加载或选择股票列表（支持缓存）
+        
+        流程：
+        1. 如果启用缓存且缓存文件存在，从缓存加载
+        2. 否则，从CSV读取所有股票，选择TopK活跃股票
+        3. 将选中的股票保存到缓存文件
+        
+        缓存文件名根据top_k自动生成（如selected_stocks_3000.json），
+        避免不同股票数量的测试和正式训练互相覆盖。
+        
+        Returns:
+            list: 股票代码列表
+        """
+        # 获取配置
+        top_k = getattr(self.config, 'top_k_stocks', 3000)
+        use_cache = getattr(self.config, 'use_stock_cache', True)
+        cache_file = getattr(self.config, 'stock_cache_file', None)
+        selection_days = getattr(self.config, 'stock_selection_days', 365)
+        
+        # 如果没有指定缓存文件名，根据top_k自动生成
+        if cache_file is None:
+            cache_file = f'selected_stocks_{top_k}.json'
+        
+        # 构建缓存文件完整路径
+        cache_path = Path(__file__).parent / cache_file
+        
+        # 1. 尝试从缓存加载
+        if use_cache and cache_path.exists():
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                
+                cached_symbols = cached_data.get('symbols', [])
+                cached_top_k = cached_data.get('top_k', 0)
+                cached_days = cached_data.get('selection_days', 0)
+                cached_date_str = cached_data.get('selection_date', 'unknown')
+                
+                # 验证缓存是否有效
+                if cached_symbols and len(cached_symbols) > 0:
+                    logger.info(f"从缓存文件加载股票列表: {cache_path}")
+                    logger.info(f"  缓存参数: top_k={cached_top_k}, selection_days={cached_days}")
+                    logger.info(f"  缓存日期: {cached_date_str}")
+                    logger.info(f"  加载 {len(cached_symbols)} 支股票")
+                    
+                    # 如果配置的top_k比缓存的少，只返回前top_k个
+                    if top_k < len(cached_symbols):
+                        logger.info(f"  当前配置top_k={top_k}，从缓存中取前{top_k}支股票")
+                        return cached_symbols[:top_k]
+                    
+                    return cached_symbols
+            except Exception as e:
+                logger.warning(f"加载缓存文件失败: {e}，将重新选择股票")
+        
+        # 2. 从CSV读取所有股票代码
+        logger.info(f"{'重新' if use_cache else ''}选择TopK={top_k}活跃股票（基于最近{selection_days}天数据）")
+        csv_path = Path(__file__).parent / "stock_code_US.csv"
+        
+        if not csv_path.exists():
+            logger.warning(f"CSV文件不存在: {csv_path}，使用默认股票列表")
+            default_symbols = self._get_default_symbols()
+            return default_symbols[:min(len(default_symbols), top_k)]
+        
+        try:
+            # 读取CSV文件 - 只使用symbol列
+            df = pd.read_csv(csv_path)
+            
+            if 'symbol' not in df.columns:
+                logger.error("CSV文件中缺少'symbol'列")
+                return self._get_default_symbols()[:top_k]
+            
+            # 过滤有效股票代码
+            df = df[df['symbol'].notna()]
+            df = df[df['symbol'].apply(lambda x: isinstance(x, str) and len(x) > 0 and not x.startswith('-'))]
+            all_symbols = df['symbol'].tolist()
+            
+            logger.info(f"从CSV读取到 {len(all_symbols)} 支股票代码")
+            
+            # 如果CSV中的股票数量少于top_k，直接返回所有股票
+            if len(all_symbols) <= top_k:
+                logger.info(f"CSV中股票数量({len(all_symbols)})未超过top_k({top_k})，使用全部股票")
+                selected_symbols = all_symbols
+            else:
+                # 3. 通过实时API选择TopK活跃股票
+                logger.info(f"开始从 {len(all_symbols)} 支股票中选择 {top_k} 支最活跃的股票")
+                selected_symbols = self._select_top_k_active_stocks(all_symbols, top_k, selection_days)
+            
+            # 4. 保存到缓存文件
+            cache_data = {
+                'symbols': selected_symbols,
+                'top_k': top_k,
+                'selection_days': selection_days,
+                'selection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'total_candidates': len(all_symbols)
+            }
+            
+            try:
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    json.dump(cache_data, f, indent=2, ensure_ascii=False)
+                logger.info(f"股票列表已保存到缓存文件: {cache_path}")
+            except Exception as e:
+                logger.warning(f"保存缓存文件失败: {e}")
+            
+            return selected_symbols
+            
+        except Exception as e:
+            logger.error(f"选择股票失败: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return self._get_default_symbols()[:top_k]
+    
+    def _select_top_k_active_stocks(self, symbols, top_k, selection_days):
+        """
+        从给定股票列表中选择TopK最活跃的股票
+        
+        基于最近N天的平均成交量和数据完整性进行评分
         
         Args:
-            symbols: 待筛选的股票列表
-            target_count: 目标股票数量
-            sample_days: 采样天数，None则从配置读取
+            symbols: 候选股票列表
+            top_k: 需要选择的股票数量
+            selection_days: 用于评估的天数
             
         Returns:
-            list: 筛选后的股票列表
+            list: 选中的TopK股票列表
         """
-        # 从配置读取采样天数
-        if sample_days is None:
-            sample_days = getattr(self.config, 'sampling_days', 30)
-        
-        logger.info(f"开始采样筛选：从{len(symbols)}支股票中选择{target_count}支活跃股票...")
-        logger.info(f"采样最近{sample_days}天的数据进行筛选")
+        logger.info(f"基于最近{selection_days}天的数据评估股票活跃度...")
         
         stock_scores = {}
         checked_count = 0
@@ -155,8 +264,8 @@ class SinaDataProcessor(BaseDataProcessor):
         # 随机打乱顺序，避免总是检查前面的股票
         random.shuffle(symbols)
         
-        # 限制检查的股票数量（最多检查target_count的3倍）
-        symbols_to_check = symbols[:min(len(symbols), target_count * 3)]
+        # 限制检查的股票数量（最多检查top_k的3倍，以提高效率）
+        symbols_to_check = symbols[:min(len(symbols), top_k * 3)]
         
         for symbol in symbols_to_check:
             try:
@@ -166,105 +275,73 @@ class SinaDataProcessor(BaseDataProcessor):
                 if response.status_code == 200 and response.text:
                     data = json.loads(response.text)
                     
-                    if data and len(data) >= sample_days:
-                        # 计算最近几天的平均成交量
-                        recent_data = data[-sample_days:]
-                        volumes = [float(d['volume']) for d in recent_data if 'volume' in d]
+                    # 检查是否有足够的数据
+                    if data and len(data) >= min(30, selection_days):  # 至少30天数据
+                        # 取最近N天的数据
+                        recent_data = data[-selection_days:] if len(data) >= selection_days else data
                         
-                        if volumes:
+                        # 计算平均成交量和数据完整性
+                        volumes = []
+                        for d in recent_data:
+                            if 'volume' in d:
+                                try:
+                                    vol = float(d['volume'])
+                                    if vol > 0:  # 过滤无效数据
+                                        volumes.append(vol)
+                                except:
+                                    continue
+                        
+                        if len(volumes) >= min(20, selection_days // 2):  # 至少一半天数有数据
+                            # 计算评分：平均成交量 × 数据完整性权重
                             avg_volume = sum(volumes) / len(volumes)
-                            # 分数 = 平均成交量 + 数据完整性奖励
-                            score = avg_volume * (1 + len(volumes) / sample_days)
-                            stock_scores[symbol] = score
+                            completeness = len(volumes) / len(recent_data)  # 数据完整性
+                            score = avg_volume * (1 + completeness)  # 成交量越大，数据越完整，分数越高
                             
+                            stock_scores[symbol] = {
+                                'score': score,
+                                'avg_volume': avg_volume,
+                                'completeness': completeness,
+                                'data_points': len(volumes)
+                            }
+                
                 checked_count += 1
-                if checked_count % 50 == 0:
-                    logger.info(f"已检查 {checked_count}/{len(symbols_to_check)} 支股票，找到 {len(stock_scores)} 支有效股票")
+                
+                # 定期输出进度
+                if checked_count % 100 == 0:
+                    logger.info(f"  已评估 {checked_count}/{len(symbols_to_check)} 支股票，找到 {len(stock_scores)} 支有效股票")
                     
             except Exception as e:
+                # 跳过无法获取数据的股票
                 continue
         
-        # 按分数排序，选择前target_count支
-        sorted_stocks = sorted(stock_scores.items(), key=lambda x: x[1], reverse=True)
-        selected_symbols = [s[0] for s in sorted_stocks[:target_count]]
+        logger.info(f"评估完成：从 {len(symbols_to_check)} 支中找到 {len(stock_scores)} 支有效股票")
         
-        logger.info(f"筛选完成：从{len(symbols)}支中选出{len(selected_symbols)}支活跃股票")
+        # 如果有效股票不足top_k，用未检查的股票随机补充
+        if len(stock_scores) < top_k:
+            logger.warning(f"有效股票数量({len(stock_scores)})少于top_k({top_k})，随机补充")
+            remaining_symbols = [s for s in symbols if s not in stock_scores]
+            random.shuffle(remaining_symbols)
+            additional_count = top_k - len(stock_scores)
+            additional = remaining_symbols[:additional_count]
+            
+            # 给补充的股票一个较低的默认分数
+            for sym in additional:
+                stock_scores[sym] = {'score': 0, 'avg_volume': 0, 'completeness': 0, 'data_points': 0}
+            
+            logger.info(f"  随机补充了 {len(additional)} 支股票")
+        
+        # 按评分排序，选择TopK
+        sorted_stocks = sorted(stock_scores.items(), key=lambda x: x[1]['score'], reverse=True)
+        selected_symbols = [s[0] for s in sorted_stocks[:top_k]]
+        
+        # 输出TopK统计信息
+        if len(sorted_stocks) > 0:
+            top_scores = [s[1] for s in sorted_stocks[:min(10, len(sorted_stocks))]]
+            top_volumes = [f"{s['avg_volume']:.0f}" for s in top_scores]
+            logger.info(f"Top{min(10, len(sorted_stocks))}股票平均成交量: {top_volumes}")
+        
+        logger.info(f"最终选择 {len(selected_symbols)} 支股票")
         return selected_symbols
-    
-    def _load_symbols_from_csv(self):
-        """
-        从stock_code_US.csv文件中加载股票代码列表
-        
-        注意：CSV文件中的数据（市值、成交量等）是过时的，严禁使用！
-        仅使用CSV中的symbol列获取股票代码。
-        
-        筛选方案：
-        - 如果不限制数量：返回所有股票代码
-        - 如果限制数量：通过实时API采样筛选活跃股票
-        
-        Returns:
-            list: 股票代码列表
-        """
-        csv_path = Path(__file__).parent / "stock_code_US.csv"
-        
-        if not csv_path.exists():
-            logger.warning(f"CSV文件不存在: {csv_path}，使用默认股票代码列表")
-            return self._get_default_symbols()
-        
-        try:
-            # 读取CSV文件 - 只使用symbol列，其他数据都是过时的
-            df = pd.read_csv(csv_path)
-            
-            # 检查必要的列是否存在
-            if 'symbol' not in df.columns:
-                logger.error("CSV文件中缺少'symbol'列")
-                return self._get_default_symbols()
-            
-            # 只提取symbol列，过滤掉无效的股票代码
-            df = df[df['symbol'].notna()]
-            df = df[df['symbol'].apply(lambda x: isinstance(x, str) and len(x) > 0 and not x.startswith('-'))]
-            
-            # 获取所有有效的股票代码
-            all_symbols = df['symbol'].tolist()
-            logger.info(f"从CSV文件读取到 {len(all_symbols)} 支股票代码")
-            
-            # 获取配置
-            max_symbols = getattr(self.config, 'max_sina_symbols', None)
-            
-            # 如果不限制数量，直接返回所有股票
-            if max_symbols is None:
-                logger.info(f"不限制股票数量，使用全部 {len(all_symbols)} 支股票")
-                return all_symbols
-            
-            # 如果CSV中的股票数量已经少于或等于目标数量，直接返回
-            if len(all_symbols) <= max_symbols:
-                logger.info(f"CSV中股票数量({len(all_symbols)})未超过限制({max_symbols})，使用全部股票")
-                return all_symbols
-            
-            # 需要筛选：通过实时API采样筛选活跃股票
-            logger.info(f"需要从{len(all_symbols)}支股票中筛选出{max_symbols}支活跃股票")
-            logger.info("注意：CSV文件数据已过时，将通过实时API采样最新数据进行筛选")
-            
-            selected_symbols = self._filter_symbols_by_sampling(all_symbols, max_symbols)
-            
-            # 如果筛选结果太少（可能因为网络问题或API限制），随机补充
-            if len(selected_symbols) < max_symbols // 2:
-                logger.warning(f"实时筛选结果不足（{len(selected_symbols)}支），使用随机选择补充")
-                remaining_symbols = [s for s in all_symbols if s not in selected_symbols]
-                random.shuffle(remaining_symbols)
-                additional_count = max_symbols - len(selected_symbols)
-                additional = remaining_symbols[:additional_count]
-                selected_symbols.extend(additional)
-                logger.info(f"随机补充了 {len(additional)} 支股票")
-            
-            logger.info(f"最终筛选出 {len(selected_symbols)} 支股票用于训练")
-            return selected_symbols
-            
-        except Exception as e:
-            logger.error(f"加载股票代码失败: {str(e)}，使用默认股票代码列表")
-            import traceback
-            logger.error(traceback.format_exc())
-            return self._get_default_symbols()
     
     def _get_default_symbols(self):
         """
