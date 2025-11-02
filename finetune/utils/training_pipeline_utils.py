@@ -87,6 +87,10 @@ def get_future_business_days(start_date, num_days):
         return business_days
 
 
+# 模块级全局变量，确保日志只初始化一次
+_LOGGING_INITIALIZED = False
+_LOGGING_INSTANCE = None
+
 def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, data_source=None, model_version=None):
     """
     设置日志配置，使用上海时区，保存到文件（带日期和股票数量后缀）
@@ -101,14 +105,11 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     """
     import pytz
     
-    # 使用类属性确保全局唯一性
-    if not hasattr(setup_logging, '_initialized'):
-        setup_logging._initialized = False
-        setup_logging._logger = None
+    global _LOGGING_INITIALIZED, _LOGGING_INSTANCE
     
     # 如果已初始化，直接返回已存在的logger
-    if setup_logging._initialized and setup_logging._logger is not None:
-        return setup_logging._logger
+    if _LOGGING_INITIALIZED and _LOGGING_INSTANCE is not None:
+        return _LOGGING_INSTANCE
     
     # 设置上海时区
     shanghai_tz = pytz.timezone('Asia/Shanghai')
@@ -151,7 +152,7 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     
-    # 彻底清除所有现有的处理器
+    # 彻底清除所有现有的处理器（避免重复）
     for handler in root_logger.handlers[:]:
         handler.close()
         root_logger.removeHandler(handler)
@@ -165,7 +166,7 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     kronos_logger.setLevel(log_level)
     kronos_logger.propagate = True  # 确保消息传播到root logger
     
-    # 添加控制台处理器到root
+    # 添加控制台处理器到root（只输出到控制台，不重复到文件）
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(formatter)
@@ -178,10 +179,10 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     root_logger.addHandler(file_handler)
     
     # 标记为已初始化并保存logger实例
-    setup_logging._initialized = True
-    setup_logging._logger = kronos_logger
+    _LOGGING_INITIALIZED = True
+    _LOGGING_INSTANCE = kronos_logger
     
-    kronos_logger.info(f"日志文件: {log_filepath} (上海时区)")
+    kronos_logger.info(f"日志系统初始化完成 - 文件: {log_filepath} (上海时区)")
     
     return kronos_logger
 

@@ -429,7 +429,10 @@ class SinaDataProcessor(BaseDataProcessor):
     def download_data(self):
         """从新浪财经下载股票数据"""
         total_symbols = len(self.symbols)
-        logger.info(f"开始从新浪财经下载数据，共 {total_symbols} 支股票")
+        logger.info(f"=" * 80)
+        logger.info(f"开始从新浪财经下载股票数据")
+        logger.info(f"  股票总数: {total_symbols} 支")
+        logger.info(f"=" * 80)
         
         # 计算日志打印间隔，确保总共打印约10次
         log_interval = max(1, total_symbols // 10)
@@ -472,9 +475,14 @@ class SinaDataProcessor(BaseDataProcessor):
                 
                 # 定期输出进度 - 只打印约10次
                 if (symbol_idx + 1) % log_interval == 0 or (symbol_idx + 1) == total_symbols:
-                    logger.info(f"下载进度: {symbol_idx + 1}/{total_symbols} - 成功: {success_count}, 失败: {failed_count} "
-                              f"(请求失败:{fail_reasons['http_failed']}, 空数据:{fail_reasons['empty_data']}, "
-                              f"数据不足:{fail_reasons['insufficient_data']}, 异常:{fail_reasons['exception']})")
+                    completed = symbol_idx + 1
+                    progress_pct = (completed / total_symbols) * 100
+                    logger.info(f"下载进度: [{completed:>4}/{total_symbols}] ({progress_pct:>5.1f}%) | "
+                              f"成功: {success_count:>4}, 失败: {failed_count:>4} | "
+                              f"失败原因 - 请求失败:{fail_reasons['http_failed']:>3}, "
+                              f"空数据:{fail_reasons['empty_data']:>3}, "
+                              f"数据不足:{fail_reasons['insufficient_data']:>3}, "
+                              f"异常:{fail_reasons['exception']:>3}")
                     
             except Exception as e:
                 failed_count += 1
@@ -483,11 +491,17 @@ class SinaDataProcessor(BaseDataProcessor):
                 if fail_reasons['exception'] <= 3:
                     logger.error(f"处理股票 {symbol_code} 时出错: {str(e)}")
         
-        logger.info(f"数据下载完成 - 总计: {total_symbols}支, 成功: {success_count}支, 失败: {failed_count}支")
-        logger.info(f"失败原因统计: HTTP请求失败:{fail_reasons['http_failed']}, "
-                   f"API返回空数据:{fail_reasons['empty_data']}, "
-                   f"数据不足(<10条):{fail_reasons['insufficient_data']}, "
-                   f"异常错误:{fail_reasons['exception']}")
+        logger.info(f"=" * 80)
+        logger.info(f"数据下载完成")
+        logger.info(f"  总计: {total_symbols} 支")
+        logger.info(f"  成功: {success_count} 支 ({success_count/total_symbols*100:.1f}%)")
+        logger.info(f"  失败: {failed_count} 支 ({failed_count/total_symbols*100:.1f}%)")
+        logger.info(f"失败原因详细统计:")
+        logger.info(f"  - HTTP请求失败: {fail_reasons['http_failed']} 支")
+        logger.info(f"  - API返回空数据: {fail_reasons['empty_data']} 支")
+        logger.info(f"  - 数据不足(<10条): {fail_reasons['insufficient_data']} 支")
+        logger.info(f"  - 异常错误: {fail_reasons['exception']} 支")
+        logger.info(f"=" * 80)
     
     def _json_to_dataframe(self, data_json, symbol_code):
         """将JSON数据转换为DataFrame"""
