@@ -17,12 +17,19 @@
 #
 # 时间设置：
 #   脚本会提示输入任务执行时间：
-#   - 小时 (0-23): 例如 0 表示凌晨零点，2 表示凌晨2点
-#   - 分钟 (0-59): 例如 0 表示整点，30 表示半点
+#   - 小时 (0-23): 例如 0 表示凌晨零点，5 表示早上5点
+#   - 分钟 (0-59): 例如 0 表示整点，5 表示5分
+#   
+# 默认时间（针对美股数据）：
+#   每天早上05:05运行（上海时间）
+#   - 美股收盘时间：美东时间 4:00 PM
+#   - 收盘后5分钟：美东时间 4:05 PM
+#   - 转换到上海时间：次日 5:05 AM（冬令时）或 4:05 AM（夏令时）
+#   - 为确保数据可用，使用 5:05 AM 作为默认启动时间
 #   
 # 示例：
 #   每天凌晨00:00运行: 小时=0, 分钟=0
-#   每天凌晨02:30运行: 小时=2, 分钟=30
+#   每天早上05:05运行: 小时=5, 分钟=5（推荐，美股数据）
 #   每天上午09:00运行: 小时=9, 分钟=0
 #
 # 日志文件：
@@ -38,8 +45,9 @@
 # 注意事项：
 #   1. 脚本会自动配置conda环境，无需手动激活
 #   2. 如果已存在Kronos定时任务，会先删除旧任务再添加新任务
-#   3. 建议在服务器负载较低的时间段（如凌晨）执行训练
-#   4. 定时任务会在后台运行，不会阻塞其他操作
+#   3. 默认时间已优化为美股收盘后启动（上海时间早上5:05）
+#   4. 如需抓取其他市场数据，可根据实际需求调整启动时间
+#   5. 定时任务会在后台运行，不会阻塞其他操作
 #
 # 作者: Kronos Team
 # 版本: 2.0
@@ -65,17 +73,17 @@ echo ""
 
 # 检查训练脚本是否存在
 if [ ! -f "$DAILY_TRAIN_SCRIPT" ]; then
-    echo -e "${RED}错误: 找不到训练脚本 $DAILY_TRAIN_SCRIPT${NC}"
+    printf "${RED}错误: 找不到训练脚本 $DAILY_TRAIN_SCRIPT${NC}\n"
     exit 1
 fi
 
 # 确保训练脚本有执行权限
 chmod +x "$DAILY_TRAIN_SCRIPT"
-echo -e "${GREEN}✓${NC} 训练脚本: $DAILY_TRAIN_SCRIPT"
+printf "${GREEN}✓${NC} 训练脚本: $DAILY_TRAIN_SCRIPT\n"
 
 # 创建日志目录
 mkdir -p "$LOG_DIR"
-echo -e "${GREEN}✓${NC} 日志目录: $LOG_DIR"
+printf "${GREEN}✓${NC} 日志目录: $LOG_DIR\n"
 
 # 显示当前crontab
 echo ""
@@ -92,43 +100,47 @@ echo "2) 删除Kronos相关定时任务"
 echo "3) 查看当前定时任务"
 echo "4) 退出"
 echo ""
-read -p "请输入选项 [1-4]: " choice
+read -p "请输入选项 [1-4，默认: 1]: " choice
+
+# 设置默认值
+choice=${choice:-1}
 
 case $choice in
     1)
         echo ""
         echo "设置每日训练时间"
         echo "----------------------------"
-        echo "建议在凌晨进行训练（例如：02:00）"
+        echo "默认时间：05:05（美股收盘后5分钟，美东时间4:05 PM对应上海时间次日5:05 AM）"
+        echo "说明：建议在美股收盘后执行，以抓取最新的美股数据"
         echo ""
-        read -p "请输入小时 (0-23) [默认: 2]: " hour
-        read -p "请输入分钟 (0-59) [默认: 0]: " minute
+        read -p "请输入小时 (0-23) [默认: 5]: " hour
+        read -p "请输入分钟 (0-59) [默认: 5]: " minute
         
-        hour=${hour:-2}
-        minute=${minute:-0}
+        hour=${hour:-5}
+        minute=${minute:-5}
         
         # 验证输入（兼容sh和bash）
         case "$hour" in
             ''|*[!0-9]*) 
-                echo -e "${RED}错误: 小时必须是数字${NC}"
+                printf "${RED}错误: 小时必须是数字${NC}\n"
                 exit 1
                 ;;
         esac
         
         if [ "$hour" -lt 0 ] || [ "$hour" -gt 23 ]; then
-            echo -e "${RED}错误: 小时必须是0-23之间${NC}"
+            printf "${RED}错误: 小时必须是0-23之间${NC}\n"
             exit 1
         fi
         
         case "$minute" in
             ''|*[!0-9]*) 
-                echo -e "${RED}错误: 分钟必须是数字${NC}"
+                printf "${RED}错误: 分钟必须是数字${NC}\n"
                 exit 1
                 ;;
         esac
         
         if [ "$minute" -lt 0 ] || [ "$minute" -gt 59 ]; then
-            echo -e "${RED}错误: 分钟必须是0-59之间${NC}"
+            printf "${RED}错误: 分钟必须是0-59之间${NC}\n"
             exit 1
         fi
         
@@ -142,7 +154,7 @@ case $choice in
         (crontab -l 2>/dev/null; echo "# Kronos 每日训练任务"; echo "# 日志由 daily_train.sh 内部处理，无需cron重定向"; echo "$cron_entry") | crontab -
         
         echo ""
-        echo -e "${GREEN}✓ 定时任务已设置${NC}"
+        printf "${GREEN}✓ 定时任务已设置${NC}\n"
         echo ""
         echo "任务详情:"
         echo "  执行时间: 每天 $hour:$(printf "%02d" $minute)"
@@ -159,7 +171,7 @@ case $choice in
         echo ""
         echo "正在删除Kronos相关定时任务..."
         (crontab -l 2>/dev/null | grep -v "daily_train" | grep -v "Kronos" || true) | crontab -
-        echo -e "${GREEN}✓ Kronos定时任务已删除${NC}"
+        printf "${GREEN}✓ Kronos定时任务已删除${NC}\n"
         echo ""
         echo "当前的定时任务："
         echo "----------------------------"
@@ -181,7 +193,7 @@ case $choice in
         ;;
         
     *)
-        echo -e "${RED}无效选项${NC}"
+        printf "${RED}无效选项${NC}\n"
         exit 1
         ;;
 esac
