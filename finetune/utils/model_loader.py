@@ -34,7 +34,7 @@ def _load_model_configs() -> Dict:
     
     config_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'extracted_configs',
+        'configs',
         'kronos_models_config.json'
     )
     

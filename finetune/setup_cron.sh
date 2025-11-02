@@ -1,11 +1,55 @@
 #!/bin/bash
-# Kronos 定时任务设置脚本（优化版本）
-# 用于设置每日自动训练任务
+################################################################################
+# Kronos 定时任务设置脚本
+# 
+# 功能说明：
+#   用于配置和管理Kronos模型的每日自动训练定时任务（crontab）
+#   自动设置cron任务，在指定时间运行daily_train.sh进行模型训练
+#
+# 使用方法：
+#   bash setup_cron.sh
+#   
+# 功能选项：
+#   1) 添加/更新每日训练定时任务 - 设置新的定时任务或更新现有任务
+#   2) 删除Kronos相关定时任务    - 移除所有Kronos定时任务
+#   3) 查看当前定时任务          - 显示当前所有crontab任务
+#   4) 退出                      - 退出脚本
+#
+# 时间设置：
+#   脚本会提示输入任务执行时间：
+#   - 小时 (0-23): 例如 0 表示凌晨零点，2 表示凌晨2点
+#   - 分钟 (0-59): 例如 0 表示整点，30 表示半点
+#   
+# 示例：
+#   每天凌晨00:00运行: 小时=0, 分钟=0
+#   每天凌晨02:30运行: 小时=2, 分钟=30
+#   每天上午09:00运行: 小时=9, 分钟=0
+#
+# 日志文件：
+#   - 训练日志: logs/training_YYYYMMDD_sina_base_k3000.log
+#   （由 daily_train.sh 内部管理，无需cron额外重定向）
+#
+# 管理命令：
+#   - 查看定时任务: crontab -l
+#   - 编辑定时任务: crontab -e
+#   - 查看训练日志: tail -f logs/training_$(date +%Y%m%d)*.log
+#   - 手动运行:    bash daily_train.sh
+#
+# 注意事项：
+#   1. 脚本会自动配置conda环境，无需手动激活
+#   2. 如果已存在Kronos定时任务，会先删除旧任务再添加新任务
+#   3. 建议在服务器负载较低的时间段（如凌晨）执行训练
+#   4. 定时任务会在后台运行，不会阻塞其他操作
+#
+# 作者: Kronos Team
+# 版本: 2.0
+# 更新时间: 2025-11-02
+################################################################################
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DAILY_TRAIN_SCRIPT="${SCRIPT_DIR}/daily_train_optimized.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DAILY_TRAIN_SCRIPT="${SCRIPT_DIR}/daily_train.sh"
 LOG_DIR="${SCRIPT_DIR}"  # 日志输出到脚本当前目录
 
 # 颜色定义
@@ -63,25 +107,39 @@ case $choice in
         hour=${hour:-2}
         minute=${minute:-0}
         
-        # 验证输入
-        if ! [[ "$hour" =~ ^[0-9]+$ ]] || [ "$hour" -lt 0 ] || [ "$hour" -gt 23 ]; then
-            echo -e "${RED}错误: 小时必须是0-23之间的数字${NC}"
+        # 验证输入（兼容sh和bash）
+        case "$hour" in
+            ''|*[!0-9]*) 
+                echo -e "${RED}错误: 小时必须是数字${NC}"
+                exit 1
+                ;;
+        esac
+        
+        if [ "$hour" -lt 0 ] || [ "$hour" -gt 23 ]; then
+            echo -e "${RED}错误: 小时必须是0-23之间${NC}"
             exit 1
         fi
         
-        if ! [[ "$minute" =~ ^[0-9]+$ ]] || [ "$minute" -lt 0 ] || [ "$minute" -gt 59 ]; then
-            echo -e "${RED}错误: 分钟必须是0-59之间的数字${NC}"
+        case "$minute" in
+            ''|*[!0-9]*) 
+                echo -e "${RED}错误: 分钟必须是数字${NC}"
+                exit 1
+                ;;
+        esac
+        
+        if [ "$minute" -lt 0 ] || [ "$minute" -gt 59 ]; then
+            echo -e "${RED}错误: 分钟必须是0-59之间${NC}"
             exit 1
         fi
         
-        # 创建新的crontab
-        cron_entry="$minute $hour * * * cd $SCRIPT_DIR && $DAILY_TRAIN_SCRIPT >> $LOG_DIR/cron_\$(date +\\%Y\\%m\\%d).log 2>&1"
+        # 创建新的crontab（日志由脚本内部处理，避免重复）
+        cron_entry="$minute $hour * * * cd $SCRIPT_DIR && $DAILY_TRAIN_SCRIPT"
         
         # 删除旧的Kronos任务
         (crontab -l 2>/dev/null | grep -v "daily_train" | grep -v "Kronos" || true) | crontab -
         
         # 添加新任务
-        (crontab -l 2>/dev/null; echo "# Kronos 每日训练任务 (优化版本)"; echo "$cron_entry") | crontab -
+        (crontab -l 2>/dev/null; echo "# Kronos 每日训练任务"; echo "# 日志由 daily_train.sh 内部处理，无需cron重定向"; echo "$cron_entry") | crontab -
         
         echo ""
         echo -e "${GREEN}✓ 定时任务已设置${NC}"
@@ -89,7 +147,7 @@ case $choice in
         echo "任务详情:"
         echo "  执行时间: 每天 $hour:$(printf "%02d" $minute)"
         echo "  脚本路径: $DAILY_TRAIN_SCRIPT"
-        echo "  日志文件: $LOG_DIR/cron_YYYYMMDD.log"
+        echo "  日志文件: logs/training_YYYYMMDD_sina_base_k3000.log（由脚本自动管理）"
         echo ""
         echo "更新后的定时任务："
         echo "----------------------------"
@@ -135,7 +193,6 @@ echo "  - 手动运行训练: $DAILY_TRAIN_SCRIPT"
 echo "  - 查看定时任务: crontab -l"
 echo "  - 编辑定时任务: crontab -e"
 echo "  - 查看训练日志: tail -f $LOG_DIR/training_\$(date +%Y%m%d)*.log"
-echo "  - 查看cron日志: tail -f $LOG_DIR/cron_\$(date +%Y%m%d).log"
 echo "  - 列出所有日志: ls -lht $LOG_DIR/training_*.log | head"
 echo "=================================================="
 

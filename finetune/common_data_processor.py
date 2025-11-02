@@ -187,7 +187,7 @@ class SinaDataProcessor(BaseDataProcessor):
         
         # 2. 从CSV读取所有股票代码
         logger.info(f"{'重新' if use_cache else ''}选择TopK={top_k}活跃股票（基于最近{selection_days}天数据）")
-        csv_path = Path(__file__).parent / "stock_code_US.csv"
+        csv_path = Path(__file__).parent / "data" / "stock_code_US.csv"
         
         if not csv_path.exists():
             logger.warning(f"CSV文件不存在: {csv_path}，使用默认股票列表")
@@ -260,33 +260,60 @@ class SinaDataProcessor(BaseDataProcessor):
         
         stock_scores = {}
         checked_count = 0
+        failed_count = 0
+        debug_sample_shown = False
         
         # 随机打乱顺序，避免总是检查前面的股票
         random.shuffle(symbols)
         
         # 限制检查的股票数量（最多检查top_k的3倍，以提高效率）
         symbols_to_check = symbols[:min(len(symbols), top_k * 3)]
+        total_to_check = len(symbols_to_check)
+        
+        # 计算打印进度的间隔，确保总共打印约10次
+        log_interval = max(1, total_to_check // 10)
         
         for symbol in symbols_to_check:
             try:
                 url = self.url_base % symbol
-                response = requests.get(url, timeout=5)
+                response = requests.get(url, timeout=10)  # 增加超时时间到10秒
                 
                 if response.status_code == 200 and response.text:
-                    data = json.loads(response.text)
+                    # 尝试解析JSON
+                    try:
+                        data = json.loads(response.text)
+                    except json.JSONDecodeError as je:
+                        # 如果是第一次，打印调试信息
+                        if not debug_sample_shown:
+                            logger.warning(f"JSON解析失败，股票 {symbol}，响应内容: {response.text[:200]}")
+                            debug_sample_shown = True
+                        failed_count += 1
+                        continue
+                    
+                    # 打印第一个成功的数据样本用于调试
+                    if not debug_sample_shown and data:
+                        logger.info(f"API响应示例（股票{symbol}）: 数据长度={len(data)}, 示例={data[:2] if len(data) >= 2 else data}")
+                        debug_sample_shown = True
                     
                     # 检查是否有足够的数据
-                    if data and len(data) >= min(30, selection_days):  # 至少30天数据
+                    if data and isinstance(data, list) and len(data) >= min(30, selection_days):  # 至少30天数据
                         # 取最近N天的数据
                         recent_data = data[-selection_days:] if len(data) >= selection_days else data
                         
                         # 计算平均成交量和数据完整性
                         volumes = []
                         for d in recent_data:
-                            if 'volume' in d:
+                            if isinstance(d, dict) and 'volume' in d:
                                 try:
                                     vol = float(d['volume'])
                                     if vol > 0:  # 过滤无效数据
+                                        volumes.append(vol)
+                                except:
+                                    continue
+                            elif isinstance(d, dict) and 'v' in d:  # 尝试另一个可能的字段名
+                                try:
+                                    vol = float(d['v'])
+                                    if vol > 0:
                                         volumes.append(vol)
                                 except:
                                     continue
@@ -303,15 +330,23 @@ class SinaDataProcessor(BaseDataProcessor):
                                 'completeness': completeness,
                                 'data_points': len(volumes)
                             }
+                    else:
+                        failed_count += 1
+                else:
+                    failed_count += 1
                 
                 checked_count += 1
                 
-                # 定期输出进度
-                if checked_count % 100 == 0:
-                    logger.info(f"  已评估 {checked_count}/{len(symbols_to_check)} 支股票，找到 {len(stock_scores)} 支有效股票")
+                # 定期输出进度 - 改为打印约10次
+                if checked_count % log_interval == 0 or checked_count == total_to_check:
+                    logger.info(f"  已评估 {checked_count}/{total_to_check} 支股票，找到 {len(stock_scores)} 支有效股票，失败 {failed_count} 支")
                     
             except Exception as e:
                 # 跳过无法获取数据的股票
+                if not debug_sample_shown:
+                    logger.warning(f"获取股票 {symbol} 数据失败: {str(e)}")
+                    debug_sample_shown = True
+                failed_count += 1
                 continue
         
         logger.info(f"评估完成：从 {len(symbols_to_check)} 支中找到 {len(stock_scores)} 支有效股票")
@@ -393,57 +428,131 @@ class SinaDataProcessor(BaseDataProcessor):
     
     def download_data(self):
         """从新浪财经下载股票数据"""
-        logger.info(f"开始从新浪财经下载数据，股票代码: {self.symbols}")
-        for symbol in trange(len(self.symbols), desc="下载股票数据"):
-            symbol_code = self.symbols[symbol]
+        total_symbols = len(self.symbols)
+        logger.info(f"开始从新浪财经下载数据，共 {total_symbols} 支股票")
+        
+        # 计算日志打印间隔，确保总共打印约10次
+        log_interval = max(1, total_symbols // 10)
+        success_count = 0
+        failed_count = 0
+        
+        # 详细的失败统计
+        fail_reasons = {
+            'http_failed': 0,      # HTTP请求失败
+            'empty_data': 0,       # API返回空数据
+            'insufficient_data': 0, # 数据不足（<10条）
+            'exception': 0         # 其他异常
+        }
+        
+        for symbol_idx in range(total_symbols):
+            symbol_code = self.symbols[symbol_idx]
             try:
                 url = self.url_base % symbol_code
                 response = self.http_get(url=url, timeout=10)
                 if response is None:
-                    logger.warning(f"无法获取股票数据: {symbol_code}")
+                    failed_count += 1
+                    fail_reasons['http_failed'] += 1
                     continue
                     
                 data_json = response.json()
                 if not data_json:
-                    logger.warning(f"股票 {symbol_code} 没有数据")
+                    failed_count += 1
+                    fail_reasons['empty_data'] += 1
                     continue
                 
                 # 转换为DataFrame
                 df = self._json_to_dataframe(data_json, symbol_code)
                 if df is None or len(df) < 10:  # 至少需要10条数据
-                    logger.warning(f"股票 {symbol_code} 数据不足")
+                    failed_count += 1
+                    fail_reasons['insufficient_data'] += 1
                     continue
                     
                 self.data[symbol_code] = df
-                logger.info(f"成功下载股票 {symbol_code} 数据，共 {len(df)} 条记录")
+                success_count += 1
+                
+                # 定期输出进度 - 只打印约10次
+                if (symbol_idx + 1) % log_interval == 0 or (symbol_idx + 1) == total_symbols:
+                    logger.info(f"下载进度: {symbol_idx + 1}/{total_symbols} - 成功: {success_count}, 失败: {failed_count} "
+                              f"(请求失败:{fail_reasons['http_failed']}, 空数据:{fail_reasons['empty_data']}, "
+                              f"数据不足:{fail_reasons['insufficient_data']}, 异常:{fail_reasons['exception']})")
+                    
             except Exception as e:
-                logger.error(f"处理股票 {symbol_code} 时出错: {str(e)}")
+                failed_count += 1
+                fail_reasons['exception'] += 1
+                # 只在前3次错误时打印详细信息
+                if fail_reasons['exception'] <= 3:
+                    logger.error(f"处理股票 {symbol_code} 时出错: {str(e)}")
         
-        logger.info(f"数据下载完成，共 {len(self.data)} 个股票")
+        logger.info(f"数据下载完成 - 总计: {total_symbols}支, 成功: {success_count}支, 失败: {failed_count}支")
+        logger.info(f"失败原因统计: HTTP请求失败:{fail_reasons['http_failed']}, "
+                   f"API返回空数据:{fail_reasons['empty_data']}, "
+                   f"数据不足(<10条):{fail_reasons['insufficient_data']}, "
+                   f"异常错误:{fail_reasons['exception']}")
     
     def _json_to_dataframe(self, data_json, symbol_code):
         """将JSON数据转换为DataFrame"""
         if not data_json:
             return None
-            
-        # 提取数据
-        dates = [item['d'] for item in data_json]
-        opens = [float(item['o']) for item in data_json]
-        closes = [float(item['c']) for item in data_json]
-        highs = [float(item['h']) for item in data_json]
-        lows = [float(item['l']) for item in data_json]
-        volumes = [int(item['v']) for item in data_json]
         
-        # 创建DataFrame
-        dates_pd = pd.to_datetime(dates)
-        df = pd.DataFrame({
-            'datetime': dates_pd,  # Use 'datetime' instead of 'date'
-            'open': opens,
-            'close': closes,
-            'high': highs,
-            'low': lows,
-            'volume': volumes
-        }, index=dates_pd)
+        try:
+            # 提取数据并过滤无效日期
+            valid_data = []
+            for item in data_json:
+                # 检查日期是否有效
+                date_str = item.get('d', '')
+                if not date_str or date_str.startswith('0000-00-00'):
+                    continue  # 跳过无效日期
+                
+                try:
+                    # 尝试提取所有字段
+                    valid_data.append({
+                        'd': date_str,
+                        'o': float(item['o']),
+                        'c': float(item['c']),
+                        'h': float(item['h']),
+                        'l': float(item['l']),
+                        'v': int(item['v'])
+                    })
+                except (KeyError, ValueError, TypeError):
+                    # 跳过数据不完整或无效的记录
+                    continue
+            
+            if not valid_data:
+                return None
+            
+            # 提取有效数据
+            dates = [item['d'] for item in valid_data]
+            opens = [item['o'] for item in valid_data]
+            closes = [item['c'] for item in valid_data]
+            highs = [item['h'] for item in valid_data]
+            lows = [item['l'] for item in valid_data]
+            volumes = [item['v'] for item in valid_data]
+            
+            # 创建DataFrame，不显示warning
+            dates_pd = pd.to_datetime(dates, errors='coerce')
+            # 移除无法解析的日期
+            valid_mask = dates_pd.notna()
+            if not valid_mask.any():
+                return None
+            
+            dates_pd = dates_pd[valid_mask]
+            opens = [opens[i] for i, v in enumerate(valid_mask) if v]
+            closes = [closes[i] for i, v in enumerate(valid_mask) if v]
+            highs = [highs[i] for i, v in enumerate(valid_mask) if v]
+            lows = [lows[i] for i, v in enumerate(valid_mask) if v]
+            volumes = [volumes[i] for i, v in enumerate(valid_mask) if v]
+            
+            df = pd.DataFrame({
+                'datetime': dates_pd,
+                'open': opens,
+                'close': closes,
+                'high': highs,
+                'low': lows,
+                'volume': volumes
+            }, index=dates_pd)
+        except Exception as e:
+            # 捕获任何异常并返回None
+            return None
         
         # 转换日期为整数格式
         df['date'] = df['datetime'].dt.strftime('%Y%m%d').astype(int)
@@ -464,7 +573,12 @@ class SinaDataProcessor(BaseDataProcessor):
         logger.info("分割数据为训练集、验证集和测试集...")
         train_data, val_data, test_data = {}, {}, {}
         
-        for symbol, df in self.data.items():
+        symbols_list = list(self.data.keys())
+        total_symbols = len(symbols_list)
+        log_interval = max(1, total_symbols // 10)
+        
+        for idx, symbol in enumerate(symbols_list):
+            df = self.data[symbol]
             # 确保数据按时间排序
             df = df.sort_index()
             
@@ -483,7 +597,15 @@ class SinaDataProcessor(BaseDataProcessor):
             val_data[symbol] = df[val_mask]
             test_data[symbol] = df[test_mask]
             
-            logger.info(f"股票 {symbol} - 训练: {len(train_data[symbol])}条, 验证: {len(val_data[symbol])}条, 测试: {len(test_data[symbol])}条")
+            # 定期输出进度 - 只打印约10次
+            if (idx + 1) % log_interval == 0 or (idx + 1) == total_symbols:
+                logger.info(f"数据分割进度: {idx + 1}/{total_symbols} - 最新: {symbol} (训练:{len(train_data[symbol])}, 验证:{len(val_data[symbol])}, 测试:{len(test_data[symbol])})")
+        
+        # 输出汇总统计
+        total_train = sum(len(df) for df in train_data.values())
+        total_val = sum(len(df) for df in val_data.values())
+        total_test = sum(len(df) for df in test_data.values())
+        logger.info(f"数据分割完成 - 训练集:{total_train}条, 验证集:{total_val}条, 测试集:{total_test}条")
         
         return {'train': train_data, 'val': val_data, 'test': test_data}
 
@@ -657,7 +779,7 @@ class QlibDataProcessor(BaseDataProcessor):
             symbol_list = list(data_df.columns)
             logger.info(f"处理 {len(symbol_list)} 个股票代码...")
             
-            for i in trange(len(symbol_list), desc="处理股票数据"):
+            for i in range(len(symbol_list)):
                 symbol = symbol_list[i]
                 symbol_df = data_df[symbol]
 
@@ -677,6 +799,11 @@ class QlibDataProcessor(BaseDataProcessor):
                     continue
 
                 self.data[symbol] = symbol_df
+                
+                # 定期输出进度 - 只打印约10次
+                log_interval = max(1, len(symbol_list) // 10)
+                if (i + 1) % log_interval == 0 or (i + 1) == len(symbol_list):
+                    logger.info(f"处理进度: {i + 1}/{len(symbol_list)} - 当前有效股票: {len(self.data)} 支")
             
             logger.info(f"数据加载完成，共 {len(self.data)} 个有效股票代码")
             return True
@@ -692,7 +819,10 @@ class QlibDataProcessor(BaseDataProcessor):
         train_data, val_data, test_data = {}, {}, {}
 
         symbol_list = list(self.data.keys())
-        for i in trange(len(symbol_list), desc="准备数据集"):
+        total_symbols = len(symbol_list)
+        log_interval = max(1, total_symbols // 10)
+        
+        for i in range(total_symbols):
             symbol = symbol_list[i]
             symbol_df = self.data[symbol]
 
@@ -710,6 +840,16 @@ class QlibDataProcessor(BaseDataProcessor):
             train_data[symbol] = symbol_df[train_mask]
             val_data[symbol] = symbol_df[val_mask]
             test_data[symbol] = symbol_df[test_mask]
+            
+            # 定期输出进度 - 只打印约10次
+            if (i + 1) % log_interval == 0 or (i + 1) == total_symbols:
+                logger.info(f"数据分割进度: {i + 1}/{total_symbols} - 最新: {symbol} (训练:{len(train_data[symbol])}, 验证:{len(val_data[symbol])}, 测试:{len(test_data[symbol])})")
+        
+        # 输出汇总统计
+        total_train = sum(len(df) for df in train_data.values())
+        total_val = sum(len(df) for df in val_data.values())
+        total_test = sum(len(df) for df in test_data.values())
+        logger.info(f"数据分割完成 - 训练集:{total_train}条, 验证集:{total_val}条, 测试集:{total_test}条")
 
         return {'train': train_data, 'val': val_data, 'test': test_data}
 

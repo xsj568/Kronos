@@ -47,8 +47,8 @@ python main.py \
   --num-workers 16 \
   --torch-threads 28
 
-# 或使用脚本
-bash run_cpu_optimized.sh
+# 或手动运行训练脚本
+bash daily_train.sh
 ```
 
 ## 📁 文件结构
@@ -103,12 +103,12 @@ python main.py --top-k-stocks 10 --no-stock-cache
 ## 📅 定时任务
 
 ```bash
-# 设置每天凌晨2点自动训练
-bash setup_daily_training.sh
+# 设置每天自动训练
+bash setup_cron.sh
 ```
 
 ## 📖 更多文档
 
-- `README.md` - 完整文档
-- `daily_train.sh` - 定时任务脚本
-- `setup_daily_training.sh` - 定时任务配置
+- `docs/README.md` - 完整文档
+- `daily_train.sh` - 定时任务训练脚本
+- `setup_cron.sh` - 定时任务配置脚本

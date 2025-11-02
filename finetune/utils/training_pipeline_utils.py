@@ -90,6 +90,7 @@ def get_future_business_days(start_date, num_days):
 def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, data_source=None, model_version=None):
     """
     设置日志配置，使用上海时区，保存到文件（带日期和股票数量后缀）
+    严格的单例模式，确保只初始化一次
     
     Args:
         log_level: 日志级别
@@ -100,10 +101,14 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     """
     import pytz
     
-    # 检查是否已经设置过日志
-    root_logger = logging.getLogger()
-    if hasattr(setup_logging, '_initialized') and setup_logging._initialized:
-        return logging.getLogger('KronosPipeline')
+    # 使用类属性确保全局唯一性
+    if not hasattr(setup_logging, '_initialized'):
+        setup_logging._initialized = False
+        setup_logging._logger = None
+    
+    # 如果已初始化，直接返回已存在的logger
+    if setup_logging._initialized and setup_logging._logger is not None:
+        return setup_logging._logger
     
     # 设置上海时区
     shanghai_tz = pytz.timezone('Asia/Shanghai')
@@ -142,31 +147,43 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # 配置根日志记录器
+    # 获取根日志记录器
+    root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
     
-    # 清除现有的处理器
-    root_logger.handlers.clear()
+    # 彻底清除所有现有的处理器
+    for handler in root_logger.handlers[:]:
+        handler.close()
+        root_logger.removeHandler(handler)
     
-    # 添加控制台处理器
+    # 获取KronosPipeline logger并清除其handlers
+    kronos_logger = logging.getLogger('KronosPipeline')
+    for handler in kronos_logger.handlers[:]:
+        handler.close()
+        kronos_logger.removeHandler(handler)
+    
+    kronos_logger.setLevel(log_level)
+    kronos_logger.propagate = True  # 确保消息传播到root logger
+    
+    # 添加控制台处理器到root
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
     
-    # 添加文件处理器
+    # 添加文件处理器到root
     file_handler = logging.FileHandler(log_filepath, mode='a', encoding='utf-8')
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
     
-    # 标记为已初始化
+    # 标记为已初始化并保存logger实例
     setup_logging._initialized = True
+    setup_logging._logger = kronos_logger
     
-    logger = logging.getLogger('KronosPipeline')
-    logger.info(f"日志文件: {log_filepath} (上海时区)")
+    kronos_logger.info(f"日志文件: {log_filepath} (上海时区)")
     
-    return logger
+    return kronos_logger
 
 def setup_ddp():
     """

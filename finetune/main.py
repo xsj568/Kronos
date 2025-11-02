@@ -111,10 +111,7 @@ class KronosTrainingPipeline:
         # 设置分布式训练标志，避免重复检查
         self.use_ddp = (use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1)
         
-        # 初始化日志（包含股票数量信息）
-        top_k = getattr(config, 'top_k_stocks', None)
-        model_ver = getattr(config, 'model_version', None)
-        setup_logging(top_k_stocks=top_k, data_source=data_source, model_version=model_ver)
+        # 日志已在main函数中初始化，这里只记录信息
         logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}")
         
         # 设置保存路径，使用config中定义的路径
@@ -1163,6 +1160,12 @@ def main():
     """主函数"""
     args = parse_args()
     
+    # 优先设置日志，避免重复
+    top_k = getattr(args, 'top_k_stocks', None)
+    model_ver = getattr(args, 'model_version', None)
+    data_source = getattr(args, 'data_source', None)
+    setup_logging(top_k_stocks=top_k, data_source=data_source, model_version=model_ver)
+    
     # 使用优化配置类创建配置
     try:
         config = create_config_from_args(args)
@@ -1171,7 +1174,7 @@ def main():
         logger.error(f"配置初始化失败: {str(e)}")
         return 1
 
-    # 创建并运行流水线
+    # 创建并运行流水线（不再重复调用setup_logging）
     pipeline = KronosTrainingPipeline(
         config=config,
         use_gpu=not args.cpu,

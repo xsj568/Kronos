@@ -79,7 +79,7 @@ def extract_from_huggingface(model_name: str, model_type: str) -> Dict[str, Any]
         return None
 
 
-def extract_all_models_from_hf(output_dir: str = './extracted_configs') -> Dict[str, Any]:
+def extract_all_models_from_hf(output_dir: str = './configs') -> Dict[str, Any]:
     """
     从Hugging Face Hub批量下载并提取所有模型配置
     
@@ -201,7 +201,7 @@ def create_model_from_config(config: Dict[str, Any], model_type: str = 'predicto
 
 def main():
     parser = argparse.ArgumentParser(description='从 Hugging Face Hub 提取 Kronos 模型配置')
-    parser.add_argument('--output-dir', type=str, default='./extracted_configs', 
+    parser.add_argument('--output-dir', type=str, default='./configs', 
                        help='输出目录')
     
     args = parser.parse_args()

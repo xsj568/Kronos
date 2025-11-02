@@ -15,23 +15,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Union
 from pathlib import Path
 
-# 初始化日志记录器
-def setup_logger():
-    """设置日志记录器"""
-    logger = logging.getLogger('KronosPipeline')
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(filename)s:%(lineno)d | %(funcName)s() | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-    return logger
-
-# 设置日志记录器
-logger = setup_logger()
+# 获取日志记录器（不在这里配置，统一由setup_logging配置）
+logger = logging.getLogger('KronosPipeline')
 
 
 class OptimizedConfig:
@@ -172,8 +157,8 @@ class OptimizedConfig:
         }
         
         # 自定义模型配置路径（先设置，customer版本需要用到）
-        self.custom_tokenizer_config = 'custom_tokenizer_config.json'
-        self.custom_predictor_config = 'custom_predictor_config.json'
+        self.custom_tokenizer_config = 'configs/custom_tokenizer_config.json'
+        self.custom_predictor_config = 'configs/custom_predictor_config.json'
         
         # 设置预训练模型路径
         if self.model_version in self.model_versions:
@@ -515,9 +500,9 @@ def parse_args():
     parser.add_argument('--model-source', type=str, default='local', 
                         choices=['auto', 'huggingface', 'modelscope', 'local'],
                         help='模型来源: local(本地,默认), auto(自动检测), huggingface(Hugging Face), modelscope(魔搭社区)')
-    parser.add_argument('--custom-tokenizer-config', type=str, default='custom_tokenizer_config.json',
+    parser.add_argument('--custom-tokenizer-config', type=str, default='configs/custom_tokenizer_config.json',
                         help='自定义tokenizer配置文件路径')
-    parser.add_argument('--custom-predictor-config', type=str, default='custom_predictor_config.json',
+    parser.add_argument('--custom-predictor-config', type=str, default='configs/custom_predictor_config.json',
                         help='自定义predictor配置文件路径')
     parser.add_argument('--early-stopping-patience', type=int, default=8,
                         help='提前终止的耐心值（连续多少个epoch测试损失没有提升就停止）')
@@ -618,18 +603,18 @@ def create_config_interactive():
     logger.info(f"选择模型版本: {model_version}")
     
     # 如果是customer版本，需要输入配置文件路径
-    custom_tokenizer_config = 'custom_tokenizer_config.json'
-    custom_predictor_config = 'custom_predictor_config.json'
+    custom_tokenizer_config = 'configs/custom_tokenizer_config.json'
+    custom_predictor_config = 'configs/custom_predictor_config.json'
     
     if model_version == 'customer':
         logger.info("\n3. 自定义模型配置:")
-        custom_tokenizer_config = input("Tokenizer配置文件路径 [默认: custom_tokenizer_config.json]: ").strip()
+        custom_tokenizer_config = input("Tokenizer配置文件路径 [默认: configs/custom_tokenizer_config.json]: ").strip()
         if not custom_tokenizer_config:
-            custom_tokenizer_config = 'custom_tokenizer_config.json'
+            custom_tokenizer_config = 'configs/custom_tokenizer_config.json'
         
-        custom_predictor_config = input("Predictor配置文件路径 [默认: custom_predictor_config.json]: ").strip()
+        custom_predictor_config = input("Predictor配置文件路径 [默认: configs/custom_predictor_config.json]: ").strip()
         if not custom_predictor_config:
-            custom_predictor_config = 'custom_predictor_config.json'
+            custom_predictor_config = 'configs/custom_predictor_config.json'
         
         logger.info(f"自定义配置路径 - Tokenizer: {custom_tokenizer_config}, Predictor: {custom_predictor_config}")
     
