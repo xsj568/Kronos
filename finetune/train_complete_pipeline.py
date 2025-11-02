@@ -13,12 +13,20 @@ import json
 import time
 import logging
 import argparse
+import traceback
 import torch
 from time import gmtime, strftime
 from pathlib import Path
 
 # 确保项目根目录在路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Comet ML 导入（可选依赖）
+try:
+    import comet_ml
+    COMET_AVAILABLE = True
+except ImportError:
+    COMET_AVAILABLE = False
 
 from config import Config
 from model.kronos import KronosTokenizer, Kronos
@@ -64,7 +72,6 @@ def process_data(config, data_source):
         return True
     except Exception as e:
         logger.error(f"处理数据时出错: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         return False
 
@@ -91,8 +98,7 @@ def train_tokenizer_gpu(config):
             
         # 设置Comet日志记录器
         comet_logger = None
-        if is_master and config.use_comet:
-            import comet_ml
+        if is_master and config.use_comet and COMET_AVAILABLE:
             comet_logger = comet_ml.Experiment(
                 api_key=config.comet_config['api_key'],
                 project_name=config.comet_config['project_name'],
@@ -131,7 +137,6 @@ def train_tokenizer_gpu(config):
         return True
     except Exception as e:
         logger.error(f"分词模型GPU训练出错: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         
         # 确保清理分布式环境
@@ -186,7 +191,6 @@ def train_tokenizer_cpu(config):
         return True
     except Exception as e:
         logger.error(f"分词模型CPU训练出错: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         return False
 
@@ -213,8 +217,7 @@ def train_predictor_gpu(config):
             
         # 设置Comet日志记录器
         comet_logger = None
-        if is_master and config.use_comet:
-            import comet_ml
+        if is_master and config.use_comet and COMET_AVAILABLE:
             comet_logger = comet_ml.Experiment(
                 api_key=config.comet_config['api_key'],
                 project_name=config.comet_config['project_name'],
@@ -251,7 +254,6 @@ def train_predictor_gpu(config):
         return True
     except Exception as e:
         logger.error(f"预测模型GPU训练出错: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         
         # 确保清理分布式环境
@@ -306,7 +308,6 @@ def train_predictor_cpu(config):
         return True
     except Exception as e:
         logger.error(f"预测模型CPU训练出错: {str(e)}")
-        import traceback
         logger.error(traceback.format_exc())
         return False
 

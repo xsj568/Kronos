@@ -8,6 +8,7 @@
 
 import os
 import logging
+import numpy as np
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -318,8 +319,6 @@ def update_master_predictions(prediction_df: pd.DataFrame,
 
 if __name__ == '__main__':
     # 测试增量更新器
-    import numpy as np
-    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s | %(levelname)-8s | %(message)s'

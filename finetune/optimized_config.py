@@ -8,6 +8,7 @@ Kronos 完整优化配置文件
 """
 
 import os
+import sys
 import json
 import logging
 import argparse
@@ -706,8 +707,6 @@ def create_config_interactive():
 
 
 if __name__ == '__main__':
-    import sys
-    
     if len(sys.argv) > 1 and sys.argv[1] == '--interactive':
         # 交互式模式
         config = create_config_interactive()

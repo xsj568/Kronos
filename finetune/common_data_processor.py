@@ -6,6 +6,10 @@ import time
 import logging
 import requests
 import random
+import subprocess
+import shutil
+import tarfile
+import traceback
 import numpy as np
 import pandas as pd
 import torch
@@ -21,6 +25,17 @@ from optimized_config import OptimizedConfig as Config
 
 # 全局logger
 logger = logging.getLogger('KronosPipeline')
+
+# Qlib相关导入（可选依赖）
+try:
+    import qlib
+    from qlib.config import REG_CN
+    from qlib.data import D
+    from qlib.data.dataset.loader import QlibDataLoader
+    QLIB_AVAILABLE = True
+except ImportError:
+    QLIB_AVAILABLE = False
+    logger.warning("Qlib未安装，相关功能将不可用")
 
 
 class BaseDataProcessor(ABC):
@@ -238,7 +253,6 @@ class SinaDataProcessor(BaseDataProcessor):
             
         except Exception as e:
             logger.error(f"选择股票失败: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())
             return self._get_default_symbols()[:top_k]
     
@@ -638,13 +652,8 @@ class QlibDataProcessor(BaseDataProcessor):
     def download_data(self):
         """初始化Qlib环境并加载数据"""
         try:
-            import qlib
-            from qlib.config import REG_CN
-            from qlib.data import D
-            from qlib.data.dataset.loader import QlibDataLoader
-            import os
-            import subprocess
-            import shutil
+            if not QLIB_AVAILABLE:
+                raise ImportError("Qlib未安装，无法使用Qlib数据源")
             
             # 确保目录存在
             data_dir = os.path.expanduser(self.config.qlib_data_path)
@@ -710,7 +719,6 @@ class QlibDataProcessor(BaseDataProcessor):
                 logger.info(f"解压数据到: {data_dir}")
                 
                 try:
-                    import tarfile
                     with tarfile.open(tar_path, "r:gz") as tar:
                         # 解压所有文件到目标目录
                         members = tar.getmembers()
@@ -823,7 +831,6 @@ class QlibDataProcessor(BaseDataProcessor):
             return True
         except Exception as e:
             logger.error(f"加载Qlib数据失败: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())
             return False
     

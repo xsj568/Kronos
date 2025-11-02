@@ -18,6 +18,7 @@ import random
 import signal
 import psutil
 import atexit
+import fcntl
 import numpy as np
 import pandas as pd
 import torch
@@ -117,7 +118,6 @@ def acquire_lock():
         lock_fd = open(LOCK_FILE, 'w')
         
         # 尝试获取独占锁（非阻塞）
-        import fcntl
         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         
         # 写入当前进程PID
@@ -141,7 +141,6 @@ def release_lock():
     
     if lock_fd:
         try:
-            import fcntl
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
             lock_fd.close()
             lock_fd = None  # 标记为已释放
