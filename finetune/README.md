@@ -24,7 +24,7 @@ python main.py
 
 **默认参数：**
 - 数据源：sina
-- 模型：local_base (本地Kronos-base模型)
+- 模型：base (Kronos-base模型，默认从本地加载)
 - 股票数量：3000
 - CPU优化：16 workers, 28 threads
 - 设备：CPU
@@ -39,7 +39,7 @@ python main.py
 ```bash
 python main.py --top-k-stocks 3000
 # 使用: selected_stocks_3000.json
-# 输出: outputs/sina/local_base_k3000/
+# 输出: outputs/sina/base_k3000/
 ```
 
 **重新选择：**
@@ -51,7 +51,7 @@ python main.py --top-k-stocks 3000 --no-stock-cache
 ```bash
 python main.py --top-k-stocks 10
 # 使用: selected_stocks_10.json  
-# 输出: outputs/sina/local_base_k10/
+# 输出: outputs/sina/base_k10/
 # ✓ 不会影响3000支股票的训练结果
 ```
 
@@ -114,7 +114,7 @@ ls -lht logs/training_*.log | head           # 列出最近日志
 ```bash
 python main.py \
     --data-source sina \              # 数据源（sina/qlib）
-    --model-version local_base \      # 模型版本（默认local_base）
+    --model-version base \            # 模型版本（默认base，从本地加载）
     --top-k-stocks 3000 \            # 股票数量
     --num-workers 16 \               # DataLoader进程数
     --torch-threads 28 \             # PyTorch线程数

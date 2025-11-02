@@ -6,8 +6,8 @@
 不同股票数量自动使用**独立的缓存和输出目录**，测试和正式训练互不干扰。
 
 ```
-测试(10支)   → selected_stocks_10.json   → outputs/sina/local_base_k10/
-正式(3000支) → selected_stocks_3000.json → outputs/sina/local_base_k3000/
+测试(10支)   → selected_stocks_10.json   → outputs/sina/base_k10/
+正式(3000支) → selected_stocks_3000.json → outputs/sina/base_k3000/
 ```
 
 ## 🚀 快速使用
@@ -59,8 +59,8 @@ finetune/
 ├── selected_stocks_3000.json    # 3000支股票缓存
 ├── outputs/
 │   └── sina/
-│       ├── local_base_k10/      # 10支股票的输出
-│       └── local_base_k3000/    # 3000支股票的输出
+│       ├── base_k10/      # 10支股票的输出
+│       └── base_k3000/    # 3000支股票的输出
 └── data/
     └── processed_datasets/       # 处理后的训练数据
 ```

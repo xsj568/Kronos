@@ -40,7 +40,7 @@ python main.py \
 #### 使用本地 base 模型（默认）
 ```bash
 python main.py \
-  --model-version local_base \
+  --model-version base \
   --data-source sina \
   --model-source local
 ```
