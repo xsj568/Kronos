@@ -28,7 +28,7 @@ class OptimizedConfig:
     
     def __init__(self, 
                  data_source: str = 'sina',
-                 model_version: str = 'local_base',  # 默认使用本地base模型
+                 model_version: str = 'base',  # 默认使用base模型
                  use_gpu: bool = True,
                  config_file: Optional[str] = None,
                  **kwargs):
@@ -124,20 +124,22 @@ class OptimizedConfig:
         self.model_source = 'local'  # 默认从本地加载，提高加载速度
         
         # 模型版本配置 - 包含所有预训练模型路径
+        # 默认使用本地路径（Kronos_models/），避免从远程下载
         self.model_versions = {
+            # 本地模型路径（默认） - 对应 finetune/Kronos_models/ 目录
             'mini': {
-                'tokenizer': 'NeoQuasar/Kronos-Tokenizer-2k',
-                'predictor': 'NeoQuasar/Kronos-mini'
+                'tokenizer': 'Kronos_models/Kronos-mini/Kronos-Tokenizer-2k',
+                'predictor': 'Kronos_models/Kronos-mini/Kronos-mini'
             },
             'small': {
-                'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
-                'predictor': 'NeoQuasar/Kronos-small'
+                'tokenizer': 'Kronos_models/Kronos-small/Kronos-Tokenizer-base',
+                'predictor': 'Kronos_models/Kronos-small/Kronos-small'
             },
             'base': {
-                'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
-                'predictor': 'NeoQuasar/Kronos-base'
+                'tokenizer': 'Kronos_models/Kronos-base/Kronos-Tokenizer-base',
+                'predictor': 'Kronos_models/Kronos-base/Kronos-base'
             },
-            # 本地模型路径 - 对应 finetune/Kronos_models/ 目录
+            # 保留 local_* 版本作为别名，兼容旧代码
             'local_mini': {
                 'tokenizer': 'Kronos_models/Kronos-mini/Kronos-Tokenizer-2k',
                 'predictor': 'Kronos_models/Kronos-mini/Kronos-mini'
@@ -149,6 +151,19 @@ class OptimizedConfig:
             'local_base': {
                 'tokenizer': 'Kronos_models/Kronos-base/Kronos-Tokenizer-base',
                 'predictor': 'Kronos_models/Kronos-base/Kronos-base'
+            },
+            # 远程模型路径（用于首次下载） - 指向 Hugging Face
+            'remote_mini': {
+                'tokenizer': 'NeoQuasar/Kronos-Tokenizer-2k',
+                'predictor': 'NeoQuasar/Kronos-mini'
+            },
+            'remote_small': {
+                'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
+                'predictor': 'NeoQuasar/Kronos-small'
+            },
+            'remote_base': {
+                'tokenizer': 'NeoQuasar/Kronos-Tokenizer-base',
+                'predictor': 'NeoQuasar/Kronos-base'
             },
             'customer': {
                 'tokenizer': None,  # 从配置文件读取
@@ -169,8 +184,16 @@ class OptimizedConfig:
                 self.pretrained_tokenizer_path = self.model_versions[self.model_version]['tokenizer']
                 self.pretrained_predictor_path = self.model_versions[self.model_version]['predictor']
                 
-                # 如果是本地模型版本，自动设置 model_source 为 'local'（如果还未指定）
-                if self.model_version.startswith('local_'):
+                # 如果是本地模型版本，自动设置 model_source 为 'local'
+                # 本地模型包括：mini/small/base, local_mini/local_small/local_base
+                # 远程模型包括：remote_mini/remote_small/remote_base
+                if self.model_version.startswith('remote_'):
+                    # 远程模型，使用 auto 模式（如果当前是 local）
+                    if self.model_source == 'local':
+                        self.model_source = 'auto'
+                        logger.info(f"检测到远程模型版本 '{self.model_version}'，自动设置 model_source='auto'")
+                else:
+                    # 本地模型（包括 base/small/mini 和 local_* 版本）
                     if self.model_source in ('auto', None):
                         self.model_source = 'local'
                         logger.info(f"检测到本地模型版本 '{self.model_version}'，自动设置 model_source='local'")
@@ -235,8 +258,9 @@ class OptimizedConfig:
         self.early_stopping_patience = 6
         
         # CPU多核优化配置
-        self.num_workers = 0  # DataLoader的worker数量，默认0，使用CPU时建议设置为4-16
+        self.num_workers = 4  # DataLoader的worker数量，默认4（优化后的值，避免创建过多子进程）
         self.torch_threads = 0  # PyTorch计算线程数，默认0表示自动，建议设置为物理核心数
+        self.max_num_workers = 8  # num_workers的最大值限制，避免创建过多子进程
         self.use_torch_compile = False  # 是否使用torch.compile()加速（PyTorch 2.0+）
         self.torch_compile_mode = 'default'  # torch.compile模式: 'default', 'reduce-overhead', 'max-autotune'
         
@@ -248,9 +272,15 @@ class OptimizedConfig:
     
     def _init_paths_config(self):
         """初始化路径相关配置"""
+        # 统一模型版本命名：去掉 'local_' 和 'remote_' 前缀，避免创建重复的文件夹
+        # 例如：local_base -> base, remote_base -> base, local_small -> small
+        # 这样无论使用 --model-version base/local_base/remote_base，
+        # 都会统一保存到 outputs/sina/base_k3000/ 和 model_history/sina/base/
+        normalized_version = self.model_version.replace('local_', '').replace('remote_', '')
+        
         # 基础保存路径（包含股票数量后缀，避免不同数量的结果互相覆盖）
         stock_suffix = f"_k{self.top_k_stocks}"
-        self.save_path = f"./outputs/{self.data_source}/{self.model_version}{stock_suffix}"
+        self.save_path = f"./outputs/{self.data_source}/{normalized_version}{stock_suffix}"
         
         # 模型保存文件夹名称
         self.tokenizer_save_folder_name = 'finetune_tokenizer'
@@ -263,7 +293,7 @@ class OptimizedConfig:
         
         # 历史模型记录目录
         self.model_history_dir = "./model_history"
-        history_subdir = f"{self.data_source}/{self.model_version}"
+        history_subdir = f"{self.data_source}/{normalized_version}"
         model_history_subdir = os.path.join(self.model_history_dir, history_subdir)
         self.his_best_tokenizer_path = os.path.join(model_history_subdir, "best_tokenizer")
         self.his_best_predictor_path = os.path.join(model_history_subdir, "best_predictor")
@@ -398,6 +428,14 @@ class OptimizedConfig:
         if self.tokenizer_learning_rate <= 0 or self.predictor_learning_rate <= 0:
             raise ValueError("学习率必须大于0")
         
+        # 验证和限制 num_workers，避免创建过多子进程
+        if self.num_workers > self.max_num_workers:
+            logger.warning(f"num_workers ({self.num_workers}) 超过最大限制 ({self.max_num_workers})，已自动调整为 {self.max_num_workers}")
+            self.num_workers = self.max_num_workers
+        if self.num_workers < 0:
+            logger.warning(f"num_workers ({self.num_workers}) 不能为负数，已调整为 0")
+            self.num_workers = 0
+        
         logger.info("配置验证通过")
     
     def get_model_config(self, model_type: str) -> Dict:
@@ -495,8 +533,9 @@ def parse_args():
     parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
     parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')
     parser.add_argument('--model-version', type=str, default='base', 
-                        choices=['mini', 'small', 'base', 'local_mini', 'local_small', 'local_base', 'customer'],
-                        help='模型版本: mini(小), small(中), base(大), local_mini/local_small/local_base(本地模型), customer(自定义配置)')
+                        choices=['mini', 'small', 'base', 'local_mini', 'local_small', 'local_base', 
+                                'remote_mini', 'remote_small', 'remote_base', 'customer'],
+                        help='模型版本: mini/small/base(本地模型，默认), local_*(本地模型别名), remote_*(远程模型), customer(自定义配置)')
     parser.add_argument('--model-source', type=str, default='local', 
                         choices=['auto', 'huggingface', 'modelscope', 'local'],
                         help='模型来源: local(本地,默认), auto(自动检测), huggingface(Hugging Face), modelscope(魔搭社区)')
@@ -507,9 +546,13 @@ def parse_args():
     parser.add_argument('--early-stopping-patience', type=int, default=8,
                         help='提前终止的耐心值（连续多少个epoch测试损失没有提升就停止）')
     
+    # 进程管理参数
+    parser.add_argument('--kill-existing', action='store_true', default=False,
+                        help='启动前自动清理已存在的训练进程（默认不清理）')
+    
     # CPU多核优化参数
-    parser.add_argument('--num-workers', type=int, default=16,
-                        help='DataLoader的worker进程数，建议设置为4-24（默认16）')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='DataLoader的worker进程数，建议设置为4-8（默认4，避免创建过多子进程）')
     parser.add_argument('--torch-threads', type=int, default=28,
                         help='PyTorch计算线程数，建议设置为物理核心数（默认28）')
     parser.add_argument('--use-torch-compile', action='store_true', default=False,
@@ -582,24 +625,24 @@ def create_config_interactive():
     
     # 模型版本选择
     logger.info("\n2. 选择模型版本:")
-    logger.info("   a) mini (小模型 - Hugging Face)")
-    logger.info("   b) small (中等模型 - Hugging Face)")
-    logger.info("   c) base (大模型 - Hugging Face)")
-    logger.info("   d) local_mini (小模型 - 本地)")
-    logger.info("   e) local_small (中等模型 - 本地)")
-    logger.info("   f) local_base (大模型 - 本地)")
-    logger.info("   g) customer (自定义配置)")
-    model_choice = input("请选择 (a/b/c/d/e/f/g) [默认: f]: ").strip().lower()
+    logger.info("   a) mini (小模型 - 本地, 推荐测试)")
+    logger.info("   b) small (中等模型 - 本地)")
+    logger.info("   c) base (大模型 - 本地, 默认)")
+    logger.info("   d) customer (自定义配置)")
+    logger.info("   e) remote_mini (从远程下载小模型)")
+    logger.info("   f) remote_small (从远程下载中等模型)")
+    logger.info("   g) remote_base (从远程下载大模型)")
+    model_choice = input("请选择 (a/b/c/d/e/f/g) [默认: c]: ").strip().lower()
     model_version_map = {
         'a': 'mini', 
         'b': 'small', 
-        'c': 'base', 
-        'd': 'local_mini', 
-        'e': 'local_small', 
-        'f': 'local_base', 
-        'g': 'customer'
+        'c': 'base',
+        'd': 'customer',
+        'e': 'remote_mini', 
+        'f': 'remote_small', 
+        'g': 'remote_base'
     }
-    model_version = model_version_map.get(model_choice, 'local_base')
+    model_version = model_version_map.get(model_choice, 'base')
     logger.info(f"选择模型版本: {model_version}")
     
     # 如果是customer版本，需要输入配置文件路径

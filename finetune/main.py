@@ -15,6 +15,9 @@ import logging
 import argparse
 import pickle
 import random
+import signal
+import psutil
+import atexit
 import numpy as np
 import pandas as pd
 import torch
@@ -60,6 +63,141 @@ from prediction_incremental_updater import PredictionIncrementalUpdater
 
 # 全局日志记录器
 logger = logging.getLogger('KronosPipeline')
+
+# 全局进程锁文件
+LOCK_FILE = '/tmp/kronos_training.lock'
+lock_fd = None
+_cleanup_done = False  # 防止重复清理的标志
+
+
+def check_and_kill_existing_processes():
+    """检查并清理已存在的训练进程（只清理同一目录下的 main.py）"""
+    current_pid = os.getpid()
+    current_file = os.path.abspath(__file__)
+    killed_count = 0
+    
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                # 检查是否是 main.py 进程（排除当前进程）
+                if proc.info['pid'] != current_pid and proc.info['cmdline']:
+                    cmdline = proc.info['cmdline']
+                    # 检查是否是 Python 进程且运行的是 main.py
+                    if len(cmdline) >= 2 and 'python' in cmdline[0].lower():
+                        # 获取被执行的脚本路径
+                        script_path = None
+                        for arg in cmdline[1:]:
+                            if arg.endswith('main.py') and not arg.startswith('-'):
+                                script_path = os.path.abspath(arg)
+                                break
+                        
+                        # 只清理同一个 main.py 文件的进程
+                        if script_path and script_path == current_file:
+                            logger.warning(f"发现已存在的训练进程 PID={proc.info['pid']}, 正在清理...")
+                            proc.terminate()
+                            killed_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        
+        if killed_count > 0:
+            logger.info(f"已清理 {killed_count} 个旧训练进程，等待2秒...")
+            time.sleep(2)
+    except Exception as e:
+        logger.warning(f"检查旧进程时出错: {e}")
+    
+    return killed_count
+
+
+def acquire_lock():
+    """获取进程锁，确保只有一个训练实例运行"""
+    global lock_fd
+    
+    try:
+        # 创建锁文件
+        lock_fd = open(LOCK_FILE, 'w')
+        
+        # 尝试获取独占锁（非阻塞）
+        import fcntl
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # 写入当前进程PID
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        
+        logger.info(f"成功获取训练锁 (PID: {os.getpid()})")
+        return True
+    except IOError:
+        logger.error("无法获取训练锁：另一个训练实例正在运行")
+        logger.error(f"如果确认没有其他训练进程，请手动删除锁文件: {LOCK_FILE}")
+        return False
+    except Exception as e:
+        logger.error(f"获取训练锁时出错: {e}")
+        return False
+
+
+def release_lock():
+    """释放进程锁（幂等操作）"""
+    global lock_fd
+    
+    if lock_fd:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            lock_fd.close()
+            lock_fd = None  # 标记为已释放
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
+            logger.info("已释放训练锁")
+        except Exception as e:
+            logger.warning(f"释放训练锁时出错: {e}")
+
+
+def cleanup_child_processes():
+    """清理所有子进程（幂等操作）"""
+    global _cleanup_done
+    
+    # 如果已经清理过，直接返回
+    if _cleanup_done:
+        return
+    
+    try:
+        current_process = psutil.Process()
+        children = current_process.children(recursive=True)
+        
+        if children:
+            logger.info(f"正在清理 {len(children)} 个子进程...")
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            # 等待子进程结束
+            gone, alive = psutil.wait_procs(children, timeout=3)
+            
+            # 强制杀死仍然存活的进程
+            for p in alive:
+                try:
+                    logger.warning(f"强制杀死子进程 PID={p.pid}")
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        
+        _cleanup_done = True  # 标记清理已完成
+    except Exception as e:
+        logger.warning(f"清理子进程时出错: {e}")
+
+
+def setup_signal_handlers():
+    """设置信号处理器，确保优雅退出"""
+    def signal_handler(signum, frame):
+        logger.info(f"接收到信号 {signum}，准备退出...")
+        # 不在这里清理，让 main 函数的 finally 块统一处理
+        # 抛出 KeyboardInterrupt 让程序优雅退出
+        raise KeyboardInterrupt(f"接收到信号 {signum}")
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 class KronosTrainingPipeline:
@@ -321,15 +459,17 @@ class KronosTrainingPipeline:
                 if model is None:
                     return False
             else:
-                # 使用新的模型加载器，默认从本地加载，支持智能回退
+                # 使用新的模型加载器，默认从本地加载
                 model_source = getattr(self.config, 'model_source', 'local')
                 logger.info(f"从 {model_source} 加载预训练分词模型: {self.config.pretrained_tokenizer_path}")
-                # 如果指定为 'local'，启用智能回退；如果为 'auto'，则自动检测
-                use_fallback = (model_source == 'local')
+                # 如果是 'local'，则禁止回退到远程；如果是 'auto'，则允许智能回退
+                use_fallback = (model_source == 'auto')
+                local_files_only = (model_source == 'local')
                 model = load_tokenizer(
                     self.config.pretrained_tokenizer_path,
                     source=model_source if model_source != 'auto' else None,
-                    fallback_on_error=use_fallback
+                    fallback_on_error=use_fallback,
+                    local_files_only=local_files_only
                 )
             
             model.to(self.device)
@@ -625,12 +765,11 @@ class KronosTrainingPipeline:
                 if model is None:
                     return False
             else:
-                # 使用新的模型加载器，默认从本地加载，支持智能回退
+                # 使用新的模型加载器，默认从本地加载
                 model_source = getattr(self.config, 'model_source', 'local')
                 logger.info(f"从 {model_source} 加载预训练预测模型: {self.config.pretrained_predictor_path}")
-                # 如果指定为 'local'，启用智能回退；如果为 'auto'，则自动检测
-                use_fallback = (model_source == 'local')
-                # 修复：local_files_only应该与model_source对应
+                # 如果是 'local'，则禁止回退到远程；如果是 'auto'，则允许智能回退
+                use_fallback = (model_source == 'auto')
                 local_files_only = (model_source == 'local')
                 model = load_predictor(
                     self.config.pretrained_predictor_path,
@@ -1123,9 +1262,10 @@ class KronosTrainingPipeline:
                 logger.info(f"最佳预测模型路径: {self.config.finetuned_predictor_path}")
                 
                 # 更新历史最佳模型路径
-                # 使用正确的model_history_subdir路径
+                # 使用正确的model_history_subdir路径，统一命名（去掉 local_ 和 remote_ 前缀）
                 model_version = getattr(self.config, 'model_version', 'default')
-                model_history_subdir = os.path.join(self.config.model_history_dir, f"{self.data_source}/{model_version}")
+                normalized_version = model_version.replace('local_', '').replace('remote_', '')
+                model_history_subdir = os.path.join(self.config.model_history_dir, f"{self.data_source}/{normalized_version}")
                 success, tokenizer_path, predictor_path = update_best_model_paths(self.config, model_history_subdir)
                 if success:
                     logger.info("已更新历史最佳模型路径")
@@ -1166,28 +1306,53 @@ def main():
     data_source = getattr(args, 'data_source', None)
     setup_logging(top_k_stocks=top_k, data_source=data_source, model_version=model_ver)
     
-    # 使用优化配置类创建配置
-    try:
-        config = create_config_from_args(args)
-        logger.info(f"配置初始化完成: {config}")
-    except Exception as e:
-        logger.error(f"配置初始化失败: {str(e)}")
-        return 1
-
-    # 创建并运行流水线（不再重复调用setup_logging）
-    pipeline = KronosTrainingPipeline(
-        config=config,
-        use_gpu=not args.cpu,
-        data_source=args.data_source,
-        early_stopping_patience=args.early_stopping_patience
-    )
-    success = pipeline.run_pipeline()
+    # 设置信号处理器
+    setup_signal_handlers()
+    logger.info("已设置进程信号处理器")
     
-    return 0 if success else 1
+    # 检查并清理旧进程（可选，通过命令行参数控制）
+    if getattr(args, 'kill_existing', False):
+        killed = check_and_kill_existing_processes()
+        if killed > 0:
+            logger.info(f"已清理 {killed} 个旧训练进程")
+    
+    # 获取进程锁，防止重复启动
+    if not acquire_lock():
+        logger.error("无法启动训练：另一个训练实例正在运行")
+        return 1
+    
+    try:
+        # 使用优化配置类创建配置
+        try:
+            config = create_config_from_args(args)
+            logger.info(f"配置初始化完成: {config}")
+        except Exception as e:
+            logger.error(f"配置初始化失败: {str(e)}")
+            return 1
+
+        # 创建并运行流水线（不再重复调用setup_logging）
+        pipeline = KronosTrainingPipeline(
+            config=config,
+            use_gpu=not args.cpu,
+            data_source=args.data_source,
+            early_stopping_patience=args.early_stopping_patience
+        )
+        success = pipeline.run_pipeline()
+        
+        return 0 if success else 1
+    finally:
+        # 确保释放锁和清理子进程
+        cleanup_child_processes()
+        release_lock()
 
 
 if __name__ == '__main__':
     try:
         sys.exit(main())
+    except KeyboardInterrupt:
+        logger.info("训练被用户中断")
+        sys.exit(130)  # 标准的 SIGINT 退出码
     except Exception as e:
+        logger.error(f"发生未预期的错误: {e}")
         logger.error(traceback.format_exc())
+        sys.exit(1)
