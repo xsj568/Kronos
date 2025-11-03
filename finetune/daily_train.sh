@@ -81,38 +81,21 @@
 # 更新时间: 2025-11-02
 ################################################################################
 
-set -e  # 遇到错误立即退出
+# 设置错误处理：遇到错误不立即退出，而是记录并继续
+set +e  # 不立即退出，允许错误处理
+set -o pipefail  # 管道命令失败时返回错误码
+
+# 切换到脚本所在目录（必须在其他操作之前）
+cd "$(dirname "$0")" || exit 1
 
 # 解决OpenSSL 3.0 legacy provider错误
 export CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1
 
-# 初始化conda环境（cron非交互式shell必需）
-CONDA_PATH="/root/autodl-tmp/miniconda3"
-if [ -f "$CONDA_PATH/etc/profile.d/conda.sh" ]; then
-    source "$CONDA_PATH/etc/profile.d/conda.sh"
-    conda activate kronos
-    echo "Conda环境已激活: $CONDA_DEFAULT_ENV"
-else
-    # 备用方案：使用conda hook
-    eval "$($CONDA_PATH/bin/conda shell.bash hook)" 2>/dev/null || true
-    conda activate kronos 2>/dev/null || echo "警告：conda环境激活可能失败"
-fi
-
-echo "=========================================="
-echo "Kronos 每日自动训练"
-echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "=========================================="
-
-# 切换到脚本所在目录
-cd "$(dirname "$0")"
-
-# 设置环境变量
-export OMP_NUM_THREADS=28
-export MKL_NUM_THREADS=28
-export OPENBLAS_NUM_THREADS=28
-export VECLIB_MAXIMUM_THREADS=28
-export NUMEXPR_NUM_THREADS=28
-export CUDA_VISIBLE_DEVICES=""
+# 设置环境变量（确保PATH包含必要路径）
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export HOME="/root"
+export USER="root"
+export SHELL="/bin/bash"
 
 # 配置参数
 DATA_SOURCE="sina"
@@ -125,7 +108,72 @@ MAX_RETRIES=3
 
 # 日志目录
 LOG_DIR="./logs"
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" || exit 1
+
+# Cron执行日志文件（记录整个脚本的执行过程，包括错误）
+CRON_LOG="$LOG_DIR/cron_$(date +%Y%m%d)_${DATA_SOURCE}_${MODEL_VERSION}_k${TOP_K_STOCKS}.log"
+
+# 将所有输出（包括错误）重定向到日志文件
+exec >> "$CRON_LOG" 2>&1
+
+# 记录脚本启动信息
+echo "=========================================="
+echo "Kronos 每日自动训练 - Cron执行日志"
+echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "脚本路径: $0"
+echo "工作目录: $(pwd)"
+echo "用户: $USER"
+echo "PATH: $PATH"
+echo "=========================================="
+
+# 初始化conda环境（cron非交互式shell必需）
+CONDA_PATH="/root/autodl-tmp/miniconda3"
+if [ -f "$CONDA_PATH/etc/profile.d/conda.sh" ]; then
+    echo "正在激活conda环境..."
+    source "$CONDA_PATH/etc/profile.d/conda.sh" || {
+        echo "错误: 无法加载conda.sh"
+        exit 1
+    }
+    conda activate kronos || {
+        echo "错误: 无法激活kronos环境"
+        exit 1
+    }
+    echo "✓ Conda环境已激活: $CONDA_DEFAULT_ENV"
+else
+    echo "警告: conda.sh不存在，尝试备用方案..."
+    # 备用方案：使用conda hook
+    if [ -f "$CONDA_PATH/bin/conda" ]; then
+        eval "$($CONDA_PATH/bin/conda shell.bash hook)" || {
+            echo "错误: conda hook初始化失败"
+            exit 1
+        }
+        conda activate kronos || {
+            echo "错误: 无法激活kronos环境（备用方案）"
+            exit 1
+        }
+        echo "✓ Conda环境已激活（备用方案）: $CONDA_DEFAULT_ENV"
+    else
+        echo "错误: conda路径不存在: $CONDA_PATH"
+        exit 1
+    fi
+fi
+
+# 验证Python环境
+PYTHON_PATH=$(which python || which python3)
+if [ -z "$PYTHON_PATH" ]; then
+    echo "错误: 无法找到python命令"
+    exit 1
+fi
+echo "✓ Python路径: $PYTHON_PATH"
+echo "✓ Python版本: $($PYTHON_PATH --version 2>&1)"
+
+# 设置环境变量
+export OMP_NUM_THREADS=28
+export MKL_NUM_THREADS=28
+export OPENBLAS_NUM_THREADS=28
+export VECLIB_MAXIMUM_THREADS=28
+export NUMEXPR_NUM_THREADS=28
+export CUDA_VISIBLE_DEVICES=""
 
 # 训练日志文件（会由Python程序自动创建，包含数据源、模型版本和股票数量）
 # 实际文件名格式：training_20251101_sina_base_k3000.log
@@ -164,18 +212,28 @@ fi
 
 # 训练函数
 train_model() {
+    echo ""
     echo "开始训练..."
     echo "训练日志将写入: $TRAIN_LOG"
-    python main.py \
+    echo "执行命令: python main.py --cpu --data-source $DATA_SOURCE --model-version $MODEL_VERSION --top-k-stocks $TOP_K_STOCKS --num-workers $NUM_WORKERS --torch-threads $TORCH_THREADS --early-stopping-patience $EARLY_STOPPING_PATIENCE"
+    
+    # 使用绝对路径执行python，确保找到正确的python
+    "$PYTHON_PATH" main.py \
         --cpu \
         --data-source "$DATA_SOURCE" \
         --model-version "$MODEL_VERSION" \
         --top-k-stocks "$TOP_K_STOCKS" \
         --num-workers "$NUM_WORKERS" \
         --torch-threads "$TORCH_THREADS" \
-        --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+        --early-stopping-patience "$EARLY_STOPPING_PATIENCE" 2>&1
     
-    return $?
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "训练失败，退出码: $exit_code"
+        echo "详细错误信息请查看: $TRAIN_LOG"
+    fi
+    
+    return $exit_code
 }
 
 # 重试机制
@@ -210,9 +268,11 @@ done
 
 # 训练结束
 echo ""
+echo ""
 echo "=========================================="
 echo "训练结束"
 echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Cron日志文件: $CRON_LOG"
 
 if [ "$success" = true ]; then
     echo "状态: ✓ 成功"
