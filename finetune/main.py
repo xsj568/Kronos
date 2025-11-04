@@ -215,27 +215,54 @@ class KronosTrainingPipeline:
             early_stopping_patience: 提前终止的耐心值
         """
         self.config = config
-        self.use_gpu = use_gpu
         self.data_source = data_source
         self.early_stopping_patience = early_stopping_patience
         self.rank = 0
         self.world_size = 1
         self.local_rank = 0
         
-        # 支持 Mac M4 MPS 和 NVIDIA CUDA
+        # GPU fallback逻辑：优先使用GPU，如果不可用自动切换到CPU
         if use_gpu:
+            # 检测GPU可用性
             if torch.cuda.is_available():
-                self.device = torch.device("cuda:0")
-                self.gpu_type = "cuda"
-            elif torch.backends.mps.is_available():
-                self.device = torch.device("mps")
-                self.gpu_type = "mps"
+                try:
+                    # 尝试分配一个小tensor来验证GPU是否真的可用
+                    test_tensor = torch.zeros(1).cuda()
+                    del test_tensor
+                    torch.cuda.empty_cache()
+                    self.device = torch.device("cuda:0")
+                    self.gpu_type = "cuda"
+                    self.use_gpu = True
+                    logger.info("检测到可用的CUDA GPU，使用GPU训练")
+                except Exception as e:
+                    logger.warning(f"CUDA GPU检测失败: {str(e)}，自动切换到CPU训练")
+                    self.device = torch.device("cpu")
+                    self.gpu_type = "cpu"
+                    self.use_gpu = False
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                try:
+                    # 尝试分配一个小tensor来验证MPS是否真的可用
+                    test_tensor = torch.zeros(1).to("mps")
+                    del test_tensor
+                    self.device = torch.device("mps")
+                    self.gpu_type = "mps"
+                    self.use_gpu = True
+                    logger.info("检测到可用的MPS设备，使用MPS训练")
+                except Exception as e:
+                    logger.warning(f"MPS设备检测失败: {str(e)}，自动切换到CPU训练")
+                    self.device = torch.device("cpu")
+                    self.gpu_type = "cpu"
+                    self.use_gpu = False
             else:
+                logger.info("未检测到GPU设备，使用CPU训练")
                 self.device = torch.device("cpu")
                 self.gpu_type = "cpu"
+                self.use_gpu = False
         else:
+            # 强制使用CPU
             self.device = torch.device("cpu")
             self.gpu_type = "cpu"
+            self.use_gpu = False
             
         # CPU多核优化：设置PyTorch线程数
         if self.gpu_type == "cpu" and hasattr(config, 'torch_threads') and config.torch_threads > 0:
@@ -655,12 +682,7 @@ class KronosTrainingPipeline:
                     evaluation_history.append(eval_info)
                     
                     # 清理临时模型文件（节省磁盘空间）
-                    # 只保留最佳模型，删除当前epoch的临时检查点
-                    try:
-                        shutil.rmtree(temp_save_path, ignore_errors=True)
-                        logger.info(f"已清理临时检查点: {temp_save_path}")
-                    except Exception as e:
-                        logger.warning(f"清理临时文件失败: {e}")
+                    shutil.rmtree(temp_save_path, ignore_errors=True)
                     
                     # 记录到Comet（如果启用）
                     if comet_logger and os.path.exists(self.config.finetuned_tokenizer_path):
@@ -962,12 +984,7 @@ class KronosTrainingPipeline:
                     evaluation_history.append(eval_info)
                     
                     # 清理临时模型文件（节省磁盘空间）
-                    # 只保留最佳模型，删除当前epoch的临时检查点
-                    try:
-                        shutil.rmtree(temp_save_path, ignore_errors=True)
-                        logger.info(f"已清理临时检查点: {temp_save_path}")
-                    except Exception as e:
-                        logger.warning(f"清理临时文件失败: {e}")
+                    shutil.rmtree(temp_save_path, ignore_errors=True)
                     
                     # 记录到Comet（如果启用）
                     if comet_logger and os.path.exists(self.config.finetuned_predictor_path):
@@ -1221,8 +1238,35 @@ class KronosTrainingPipeline:
             logger.error(traceback.format_exc())
             return False
     
+    def _fallback_to_cpu(self):
+        """切换到CPU训练模式"""
+        logger.warning("=" * 60)
+        logger.warning("检测到GPU训练失败，自动切换到CPU训练模式")
+        logger.warning("=" * 60)
+        
+        # 清理GPU资源
+        if self.gpu_type == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        
+        # 切换到CPU
+        self.use_gpu = False
+        self.gpu_type = "cpu"
+        self.device = torch.device("cpu")
+        self.use_ddp = False
+        
+        # 设置CPU多核优化
+        if hasattr(self.config, 'torch_threads') and self.config.torch_threads > 0:
+            torch.set_num_threads(self.config.torch_threads)
+            torch.set_num_interop_threads(self.config.torch_threads)
+            logger.info(f"已设置PyTorch线程数: {self.config.torch_threads}")
+        
+        logger.info("已切换到CPU训练模式，继续训练...")
+    
     def run_pipeline(self):
-        """运行完整训练流水线"""
+        """运行完整训练流水线，支持GPU失败时自动降级到CPU"""
         try:
             # 设置分布式环境（如果使用CUDA多GPU）
             if self.use_ddp:
@@ -1234,14 +1278,46 @@ class KronosTrainingPipeline:
                 return False
             
             # 训练分词模型（每轮评估并保存最佳模型）
-            if not self.train_tokenizer():
-                logger.error("分词模型训练失败，流水线终止")
-                return False
+            # 如果GPU训练失败，自动切换到CPU重试
+            try:
+                if not self.train_tokenizer():
+                    logger.error("分词模型训练失败，流水线终止")
+                    return False
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                error_msg = str(e).lower()
+                if 'cuda' in error_msg or 'gpu' in error_msg or 'out of memory' in error_msg:
+                    logger.error(f"GPU训练出错: {str(e)}")
+                    if self.use_gpu:
+                        self._fallback_to_cpu()
+                        logger.info("使用CPU重新训练分词模型...")
+                        if not self.train_tokenizer():
+                            logger.error("分词模型训练失败（CPU模式），流水线终止")
+                            return False
+                    else:
+                        raise
+                else:
+                    raise
             
             # 训练预测模型（每轮评估并保存最佳模型）
-            if not self.train_predictor():
-                logger.error("预测模型训练失败，流水线终止")
-                return False
+            # 如果GPU训练失败，自动切换到CPU重试
+            try:
+                if not self.train_predictor():
+                    logger.error("预测模型训练失败，流水线终止")
+                    return False
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                error_msg = str(e).lower()
+                if 'cuda' in error_msg or 'gpu' in error_msg or 'out of memory' in error_msg:
+                    logger.error(f"GPU训练出错: {str(e)}")
+                    if self.use_gpu:
+                        self._fallback_to_cpu()
+                        logger.info("使用CPU重新训练预测模型...")
+                        if not self.train_predictor():
+                            logger.error("预测模型训练失败（CPU模式），流水线终止")
+                            return False
+                    else:
+                        raise
+                else:
+                    raise
             
             # 验证最佳模型是否已正确选择
             if not self.evaluate_models():

@@ -529,7 +529,7 @@ class OptimizedConfig:
 def parse_args():
     """解析命令行参数 - 完全独立，不依赖外部"""
     parser = argparse.ArgumentParser(description='Kronos模型训练流水线')
-    parser.add_argument('--cpu', action='store_true', default=True, help='使用CPU训练')
+    parser.add_argument('--cpu', action='store_true', default=False, help='强制使用CPU训练（默认使用GPU，如果GPU不可用会自动切换到CPU）')
     parser.add_argument('--data-source', type=str, default='sina', choices=['qlib', 'sina'], help='数据源类型')
     parser.add_argument('--config-path', type=str, default=None, help='配置文件路径')
     parser.add_argument('--force-download', action='store_true', default=False, help='强制重新下载数据')

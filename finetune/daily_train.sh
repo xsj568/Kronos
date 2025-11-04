@@ -34,7 +34,7 @@
 # 环境变量（自动设置）：
 #   OMP_NUM_THREADS=28             # OpenMP线程数
 #   MKL_NUM_THREADS=28             # Intel MKL线程数
-#   CUDA_VISIBLE_DEVICES=""        # 禁用GPU，使用CPU
+#   CUDA_VISIBLE_DEVICES=""        # 可选：禁用GPU，使用CPU（默认使用GPU，会自动降级）
 #   CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1  # 解决OpenSSL兼容性
 #
 # 输出文件：
@@ -173,7 +173,7 @@ export MKL_NUM_THREADS=28
 export OPENBLAS_NUM_THREADS=28
 export VECLIB_MAXIMUM_THREADS=28
 export NUMEXPR_NUM_THREADS=28
-export CUDA_VISIBLE_DEVICES=""
+# CUDA_VISIBLE_DEVICES 不设置，允许使用GPU（如果需要禁用GPU，可以设置 export CUDA_VISIBLE_DEVICES=""）
 
 # 训练日志文件（会由Python程序自动创建，包含数据源、模型版本和股票数量）
 # 实际文件名格式：training_20251101_sina_base_k3000.log
@@ -215,11 +215,12 @@ train_model() {
     echo ""
     echo "开始训练..."
     echo "训练日志将写入: $TRAIN_LOG"
-    echo "执行命令: python main.py --cpu --data-source $DATA_SOURCE --model-version $MODEL_VERSION --top-k-stocks $TOP_K_STOCKS --num-workers $NUM_WORKERS --torch-threads $TORCH_THREADS --early-stopping-patience $EARLY_STOPPING_PATIENCE"
+    echo "执行命令: python main.py --data-source $DATA_SOURCE --model-version $MODEL_VERSION --top-k-stocks $TOP_K_STOCKS --num-workers $NUM_WORKERS --torch-threads $TORCH_THREADS --early-stopping-patience $EARLY_STOPPING_PATIENCE"
+    echo "注意: 默认使用GPU训练，如果GPU不可用会自动切换到CPU"
     
     # 使用绝对路径执行python，确保找到正确的python
+    # 默认使用GPU，如果GPU不可用或出错会自动降级到CPU
     "$PYTHON_PATH" main.py \
-        --cpu \
         --data-source "$DATA_SOURCE" \
         --model-version "$MODEL_VERSION" \
         --top-k-stocks "$TOP_K_STOCKS" \
