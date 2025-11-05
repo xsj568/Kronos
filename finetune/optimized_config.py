@@ -582,6 +582,10 @@ def parse_args():
     parser.add_argument('--no-stock-cache', action='store_true', default=False,
                         help='不使用缓存的股票列表，强制重新选择（默认使用缓存）')
     
+    # 训练日志参数
+    parser.add_argument('--log-interval', type=int, default=1,
+                        help='训练日志记录间隔（每N个batch记录一次），设置为1可实时查看训练进度（默认100）')
+    
     return parser.parse_args()
 
 
@@ -616,7 +620,9 @@ def create_config_from_args(args) -> OptimizedConfig:
         # 股票选择参数
         top_k_stocks=args.top_k_stocks,
         stock_selection_days=args.stock_selection_days,
-        use_stock_cache=not args.no_stock_cache
+        use_stock_cache=not args.no_stock_cache,
+        # 训练日志参数
+        log_interval=args.log_interval
     )
     
     return config

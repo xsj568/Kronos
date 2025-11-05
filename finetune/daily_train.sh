@@ -248,7 +248,9 @@ train_model() {
             --top-k-stocks "$TOP_K_STOCKS" \
             --num-workers "$NUM_WORKERS" \
             --torch-threads "$TORCH_THREADS" \
-            --early-stopping-patience "$EARLY_STOPPING_PATIENCE" 2>&1
+            --early-stopping-patience "$EARLY_STOPPING_PATIENCE" \
+            --min-gpu-memory 3.0 \
+            --log-interval 1 2>&1
     else
         # 单GPU或CPU训练：直接使用python
         if [ "$ACTUAL_NUM_GPUS" -eq 1 ]; then
@@ -264,7 +266,9 @@ train_model() {
             --top-k-stocks "$TOP_K_STOCKS" \
             --num-workers "$NUM_WORKERS" \
             --torch-threads "$TORCH_THREADS" \
-            --early-stopping-patience "$EARLY_STOPPING_PATIENCE" 2>&1
+            --early-stopping-patience "$EARLY_STOPPING_PATIENCE" \
+            --min-gpu-memory 3.0 \
+            --log-interval 1 2>&1
     fi
     
     local exit_code=$?

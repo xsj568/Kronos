@@ -77,6 +77,22 @@ lock_fd = None
 _cleanup_done = False  # 防止重复清理的标志
 
 
+def safe_loss_item(loss):
+    """
+    安全地获取loss的标量值，兼容DDP、DataParallel和单GPU模式
+    
+    Args:
+        loss: torch.Tensor - loss张量
+        
+    Returns:
+        float - loss的标量值
+    """
+    if loss.dim() == 0:  # 标量tensor
+        return loss.item()
+    else:  # DataParallel返回的多元素tensor
+        return loss.mean().item()
+
+
 def check_and_kill_existing_processes():
     """检查并清理已存在的训练进程（只清理同一目录下的 main.py）"""
     current_pid = os.getpid()
@@ -639,10 +655,7 @@ class KronosTrainingPipeline:
                     batch_x = ori_batch_x[start_idx:end_idx]
                     
                     # 前向传播
-                    if self.use_ddp:
-                        zs, bsq_loss, _, _ = model(batch_x)
-                    else:
-                        zs, bsq_loss, _, _ = model(batch_x)
+                    zs, bsq_loss, _, _ = model(batch_x)
                     z_pre, z = zs
                     
                     # 损失计算
@@ -651,13 +664,17 @@ class KronosTrainingPipeline:
                     recon_loss = recon_loss_pre + recon_loss_all
                     loss = (recon_loss + bsq_loss) / 2
                     
+                    # DataParallel返回的loss可能是多元素tensor，需要先求平均
+                    if self.use_data_parallel and loss.dim() > 0:
+                        loss = loss.mean()
+                    
                     loss_scaled = loss / self.config.accumulation_steps
-                    current_batch_total_loss += loss.item()
+                    current_batch_total_loss += safe_loss_item(loss)
                     loss_scaled.backward()
                 
                 # 优化器步骤
                 torch.nn.utils.clip_grad_norm_(
-                    model.module.parameters() if self.use_ddp else model.parameters(), 
+                    model.module.parameters() if (self.use_ddp or self.use_data_parallel) else model.parameters(), 
                     max_norm=2.0
                 )
                 optimizer.step()
@@ -686,10 +703,7 @@ class KronosTrainingPipeline:
             with torch.no_grad():
                 for ori_batch_x, _ in val_loader:
                     ori_batch_x = ori_batch_x.squeeze(0).to(self.device)
-                    if self.use_ddp:
-                        zs, _, _, _ = model(ori_batch_x)
-                    else:
-                        zs, _, _, _ = model(ori_batch_x)
+                    zs, _, _, _ = model(ori_batch_x)
                     _, z = zs
                     val_loss_item = F.mse_loss(z, ori_batch_x)
                     
@@ -954,11 +968,17 @@ class KronosTrainingPipeline:
                 else:
                     loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 
+                # DataParallel返回的loss可能是多元素tensor，需要先求平均
+                if self.use_data_parallel and loss.dim() > 0:
+                    loss = loss.mean()
+                    s1_loss = s1_loss.mean() if s1_loss.dim() > 0 else s1_loss
+                    s2_loss = s2_loss.mean() if s2_loss.dim() > 0 else s2_loss
+                
                 # 反向传播和优化
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    model.module.parameters() if self.use_ddp else model.parameters(), 
+                    model.module.parameters() if (self.use_ddp or self.use_data_parallel) else model.parameters(), 
                     max_norm=3.0
                 )
                 optimizer.step()
@@ -969,13 +989,13 @@ class KronosTrainingPipeline:
                     lr = optimizer.param_groups[0]['lr']
                     logger.info(
                         f"[Epoch {epoch_idx + 1}/{self.config.epochs}, Step {i + 1}/{len(train_loader)}] "
-                        f"LR {lr:.6f}, Loss: {loss.item():.4f}"
+                        f"LR {lr:.6f}, Loss: {safe_loss_item(loss):.4f}"
                     )
                 if self.is_master and comet_logger:
                     lr = optimizer.param_groups[0]['lr']
-                    comet_logger.log_metric('train_predictor_loss_batch', loss.item(), step=batch_idx_global)
-                    comet_logger.log_metric('train_S1_loss_each_batch', s1_loss.item(), step=batch_idx_global)
-                    comet_logger.log_metric('train_S2_loss_each_batch', s2_loss.item(), step=batch_idx_global)
+                    comet_logger.log_metric('train_predictor_loss_batch', safe_loss_item(loss), step=batch_idx_global)
+                    comet_logger.log_metric('train_S1_loss_each_batch', safe_loss_item(s1_loss), step=batch_idx_global)
+                    comet_logger.log_metric('train_S2_loss_each_batch', safe_loss_item(s2_loss), step=batch_idx_global)
                     comet_logger.log_metric('predictor_learning_rate', lr, step=batch_idx_global)
                 
                 batch_idx_global += 1
@@ -1000,7 +1020,7 @@ class KronosTrainingPipeline:
                     else:
                         val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     
-                    tot_val_loss += val_loss.item()
+                    tot_val_loss += safe_loss_item(val_loss)
                     val_batches_processed += 1
             
             # 如果是分布式训练，收集所有进程的验证损失
@@ -1454,16 +1474,25 @@ def main():
     setup_signal_handlers()
     logger.info("已设置进程信号处理器")
     
-    # 检查并清理旧进程（可选，通过命令行参数控制）
-    if getattr(args, 'kill_existing', False):
-        killed = check_and_kill_existing_processes()
-        if killed > 0:
-            logger.info(f"已清理 {killed} 个旧训练进程")
+    # 检查是否在DDP环境中
+    is_ddp = all(key in os.environ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
+    rank = int(os.environ.get('RANK', 0))
     
-    # 获取进程锁，防止重复启动
-    if not acquire_lock():
-        logger.error("无法启动训练：另一个训练实例正在运行")
-        return 1
+    # 只有主进程需要清理旧进程和获取锁（DDP模式下只有rank 0执行，避免锁冲突）
+    if not is_ddp or rank == 0:
+        # 检查并清理旧进程（可选，通过命令行参数控制）
+        if getattr(args, 'kill_existing', False):
+            killed = check_and_kill_existing_processes()
+            if killed > 0:
+                logger.info(f"已清理 {killed} 个旧训练进程")
+        
+        # 获取进程锁，防止重复启动
+        if not acquire_lock():
+            logger.error("无法启动训练：另一个训练实例正在运行")
+            return 1
+    else:
+        # DDP子进程（rank > 0）跳过锁获取
+        logger.info(f"DDP子进程 (rank={rank})，跳过进程锁检查")
     
     try:
         # 使用优化配置类创建配置
@@ -1485,9 +1514,12 @@ def main():
         
         return 0 if success else 1
     finally:
-        # 确保释放锁和清理子进程
-        cleanup_child_processes()
-        release_lock()
+        # 只有主进程才释放锁和清理子进程
+        if not is_ddp or rank == 0:
+            cleanup_child_processes()
+            release_lock()
+        else:
+            logger.info(f"DDP子进程 (rank={rank})，跳过锁释放和子进程清理")
 
 
 if __name__ == '__main__':
