@@ -110,7 +110,7 @@ class OptimizedConfig:
             # 限制股票数量（建议100-5000支，None表示使用全部）
             # 注意：CSV文件中只能用symbol列，其他数据（市值、成交量等）已过时
             # 筛选时会通过实时API采样最新数据
-            self.max_sina_symbols = 3000  # 默认3000支，通过实时数据筛选活跃股票
+            self.max_sina_symbols = 1000  # 默认1000支，通过实时数据筛选活跃股票
             
             # 实时采样天数（用于筛选活跃股票）
             # 系统会采样最近N天的交易数据，根据成交量和数据完整性评分
@@ -270,7 +270,7 @@ class OptimizedConfig:
         self.use_all_available_gpus = True  # 是否使用所有符合条件的GPU（用于DataParallel）
         
         # 股票选择配置
-        self.top_k_stocks = 3000  # 选择TopK活跃股票数量，默认3000
+        self.top_k_stocks = 1000  # 选择TopK活跃股票数量，默认1000
         self.stock_selection_days = 365  # 基于最近N天的数据选择股票，默认365天（一年）
         self.stock_cache_file = None  # 股票代码缓存文件名（自动根据top_k生成: selected_stocks_{top_k}.json）
         self.use_stock_cache = True  # 是否使用缓存的股票列表（True: 从缓存读取, False: 重新选择）
@@ -573,8 +573,8 @@ def parse_args():
                         help='禁用多GPU训练，只使用单个最佳GPU（默认启用多GPU）')
     
     # 股票选择参数
-    parser.add_argument('--top-k-stocks', type=int, default=3000,
-                        help='选择TopK活跃股票数量（默认3000）')
+    parser.add_argument('--top-k-stocks', type=int, default=1000,
+                        help='选择TopK活跃股票数量（默认1000）')
     parser.add_argument('--stock-selection-days', type=int, default=365,
                         help='基于最近N天的数据选择股票（默认365天）')
     parser.add_argument('--no-stock-cache', action='store_true', default=False,
