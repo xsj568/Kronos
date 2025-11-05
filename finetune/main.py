@@ -61,6 +61,12 @@ from utils.training_pipeline_utils import (
 from utils.model_loader import load_tokenizer, load_predictor, load_model_from_source
 from common_data_processor import DataProcessorFactory, FinancialDataset
 from prediction_incremental_updater import PredictionIncrementalUpdater
+from utils.gpu_utils import (
+    setup_gpu_for_training,
+    clear_gpu_cache,
+    print_gpu_memory_summary,
+    get_available_gpus
+)
 
 # 全局日志记录器
 logger = logging.getLogger('KronosPipeline')
@@ -222,23 +228,57 @@ class KronosTrainingPipeline:
         self.local_rank = 0
         
         # GPU fallback逻辑：优先使用GPU，如果不可用自动切换到CPU
+        # 设置设备（使用智能GPU选择）
+        self.available_gpus = []  # 可用GPU列表
+        self.use_data_parallel = False  # 是否使用DataParallel
+        
         if use_gpu:
             # 检测GPU可用性
             if torch.cuda.is_available():
                 try:
-                    # 尝试分配一个小tensor来验证GPU是否真的可用
-                    test_tensor = torch.zeros(1).cuda()
-                    del test_tensor
-                    torch.cuda.empty_cache()
-                    self.device = torch.device("cuda:0")
-                    self.gpu_type = "cuda"
-                    self.use_gpu = True
-                    logger.info("检测到可用的CUDA GPU，使用GPU训练")
+                    # 使用智能GPU选择
+                    min_free_memory_gb = getattr(config, 'min_gpu_memory_gb', 5.0)
+                    use_all_gpus = getattr(config, 'use_all_available_gpus', True)
+                    
+                    logger.info("开始检测可用GPU...")
+                    self.device, can_use_multi_gpu, self.available_gpus = setup_gpu_for_training(
+                        min_free_memory_gb=min_free_memory_gb,
+                        use_all_available=use_all_gpus
+                    )
+                    
+                    if self.device.type == "cuda":
+                        # 测试选定的GPU是否真的可用
+                        test_tensor = torch.zeros(1).to(self.device)
+                        del test_tensor
+                        clear_gpu_cache()
+                        
+                        self.gpu_type = "cuda"
+                        self.use_gpu = True
+                        
+                        # 如果有多个可用GPU，设置DataParallel
+                        if can_use_multi_gpu and len(self.available_gpus) > 1:
+                            self.use_data_parallel = True
+                            logger.info(f"启用DataParallel模式，使用 {len(self.available_gpus)} 个GPU: {self.available_gpus}")
+                        else:
+                            logger.info(f"使用单GPU训练: {self.device}")
+                        
+                        # 打印GPU内存信息
+                        print_gpu_memory_summary()
+                    else:
+                        # 没有符合要求的GPU，回退到CPU
+                        logger.warning("没有符合要求的GPU，自动切换到CPU训练")
+                        self.gpu_type = "cpu"
+                        self.use_gpu = False
+                        
                 except Exception as e:
-                    logger.warning(f"CUDA GPU检测失败: {str(e)}，自动切换到CPU训练")
+                    logger.warning(f"GPU设置失败: {str(e)}，自动切换到CPU训练")
+                    logger.warning(f"错误详情: {traceback.format_exc()}")
                     self.device = torch.device("cpu")
                     self.gpu_type = "cpu"
                     self.use_gpu = False
+                    self.available_gpus = []
+                    self.use_data_parallel = False
+                    
             elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 try:
                     # 尝试分配一个小tensor来验证MPS是否真的可用
@@ -273,10 +313,17 @@ class KronosTrainingPipeline:
         self.is_master = True  # 单进程或主进程
         
         # 设置分布式训练标志，避免重复检查
-        self.use_ddp = (use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1)
+        # 注意：如果使用DataParallel，则不使用DDP（两者互斥）
+        if self.use_data_parallel:
+            # 使用DataParallel时不使用DDP
+            self.use_ddp = False
+            logger.info(f"使用DataParallel进行多GPU训练，禁用DDP")
+        else:
+            # 只有在未使用DataParallel且满足条件时才尝试DDP
+            self.use_ddp = (use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1)
         
         # 日志已在main函数中初始化，这里只记录信息
-        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}")
+        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}, DataParallel: {self.use_data_parallel}")
         
         # 设置保存路径，使用config中定义的路径
         self.tokenizer_save_dir = os.path.join(config.save_path, config.tokenizer_save_folder_name)
@@ -513,9 +560,14 @@ class KronosTrainingPipeline:
             logger.error(f"初始化分词模型时出错: {str(e)}")
             return False
         
-        # 设置DDP
+        # 设置DDP或DataParallel
         if self.use_ddp:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
+        elif self.use_data_parallel:
+            # 使用DataParallel进行多GPU训练（不需要环境变量）
+            logger.info(f"将分词模型包装为DataParallel，使用GPU: {self.available_gpus}")
+            model = torch.nn.DataParallel(model, device_ids=self.available_gpus)
+            logger.info("DataParallel包装完成")
         
         # 创建数据加载器
         if self.use_ddp:
@@ -661,7 +713,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_ddp:
+                    if self.use_ddp or self.use_data_parallel:
                         model.module.save_pretrained(temp_save_path)
                     else:
                         model.save_pretrained(temp_save_path)
@@ -692,7 +744,7 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_tokenizer_path
-                    if self.use_ddp:
+                    if self.use_ddp or self.use_data_parallel:
                         model.module.save_pretrained(save_path)
                     else:
                         model.save_pretrained(save_path)
@@ -814,9 +866,14 @@ class KronosTrainingPipeline:
             logger.error(f"初始化模型时出错: {str(e)}")
             return False
         
-        # 设置DDP
+        # 设置DDP或DataParallel
         if self.use_ddp:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
+        elif self.use_data_parallel:
+            # 使用DataParallel进行多GPU训练（不需要环境变量）
+            logger.info(f"将预测模型包装为DataParallel，使用GPU: {self.available_gpus}")
+            model = torch.nn.DataParallel(model, device_ids=self.available_gpus)
+            logger.info("DataParallel包装完成")
         
         # 创建数据加载器
         if self.use_ddp:
@@ -880,7 +937,7 @@ class KronosTrainingPipeline:
                 
                 # 前向传播和损失计算
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                if self.use_ddp:
+                if self.use_ddp or self.use_data_parallel:
                     loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 else:
                     loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
@@ -926,7 +983,7 @@ class KronosTrainingPipeline:
                     token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
                     
                     logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                    if self.use_ddp:
+                    if self.use_ddp or self.use_data_parallel:
                         val_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     else:
                         val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
@@ -963,7 +1020,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_ddp:
+                    if self.use_ddp or self.use_data_parallel:
                         model.module.save_pretrained(temp_save_path)
                     else:
                         model.save_pretrained(temp_save_path)
@@ -994,7 +1051,7 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_predictor_path
-                    if self.use_ddp:
+                    if self.use_ddp or self.use_data_parallel:
                         model.module.save_pretrained(save_path)
                     else:
                         model.save_pretrained(save_path)

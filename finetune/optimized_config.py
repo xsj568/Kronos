@@ -265,6 +265,10 @@ class OptimizedConfig:
         self.use_torch_compile = False  # 是否使用torch.compile()加速（PyTorch 2.0+）
         self.torch_compile_mode = 'default'  # torch.compile模式: 'default', 'reduce-overhead', 'max-autotune'
         
+        # GPU配置
+        self.min_gpu_memory_gb = 5.0  # 最小GPU空闲内存要求（GB），低于此值的GPU不会被使用
+        self.use_all_available_gpus = True  # 是否使用所有符合条件的GPU（用于DataParallel）
+        
         # 股票选择配置
         self.top_k_stocks = 3000  # 选择TopK活跃股票数量，默认3000
         self.stock_selection_days = 365  # 基于最近N天的数据选择股票，默认365天（一年）
@@ -562,6 +566,12 @@ def parse_args():
                         choices=['default', 'reduce-overhead', 'max-autotune'],
                         help='torch.compile()模式（default: 平衡, reduce-overhead: 减少开销, max-autotune: 最大优化）')
     
+    # GPU优化参数
+    parser.add_argument('--min-gpu-memory', type=float, default=5.0,
+                        help='最小GPU空闲内存要求（GB），低于此值的GPU不会被使用（默认5.0 GB）')
+    parser.add_argument('--no-multi-gpu', action='store_true', default=False,
+                        help='禁用多GPU训练，只使用单个最佳GPU（默认启用多GPU）')
+    
     # 股票选择参数
     parser.add_argument('--top-k-stocks', type=int, default=3000,
                         help='选择TopK活跃股票数量（默认3000）')
@@ -598,6 +608,9 @@ def create_config_from_args(args) -> OptimizedConfig:
         torch_threads=args.torch_threads,
         use_torch_compile=args.use_torch_compile,
         torch_compile_mode=args.torch_compile_mode,
+        # GPU优化参数
+        min_gpu_memory_gb=args.min_gpu_memory,
+        use_all_available_gpus=not args.no_multi_gpu,
         # 股票选择参数
         top_k_stocks=args.top_k_stocks,
         stock_selection_days=args.stock_selection_days,
