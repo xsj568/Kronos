@@ -571,6 +571,8 @@ def parse_args():
                         help='最小GPU空闲内存要求（GB），低于此值的GPU不会被使用（默认5.0 GB）')
     parser.add_argument('--no-multi-gpu', action='store_true', default=False,
                         help='禁用多GPU训练，只使用单个最佳GPU（默认启用多GPU）')
+    parser.add_argument('--num-gpus', type=int, default=None,
+                        help='使用的GPU数量（用于torchrun启动DDP训练）。默认None表示使用所有可用GPU')
     
     # 股票选择参数
     parser.add_argument('--top-k-stocks', type=int, default=1000,

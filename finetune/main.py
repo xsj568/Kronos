@@ -230,7 +230,7 @@ class KronosTrainingPipeline:
         # GPU fallback逻辑：优先使用GPU，如果不可用自动切换到CPU
         # 设置设备（使用智能GPU选择）
         self.available_gpus = []  # 可用GPU列表
-        self.use_data_parallel = False  # 是否使用DataParallel
+        self.use_data_parallel = False  # 是否使用DataParallel（DDP不可用时的备选）
         
         if use_gpu:
             # 检测GPU可用性
@@ -255,10 +255,11 @@ class KronosTrainingPipeline:
                         self.gpu_type = "cuda"
                         self.use_gpu = True
                         
-                        # 如果有多个可用GPU，设置DataParallel
+                        # 记录可用GPU信息，但不在这里决定使用DataParallel
+                        # DDP的决策在setup_distributed()中进行
                         if can_use_multi_gpu and len(self.available_gpus) > 1:
-                            self.use_data_parallel = True
-                            logger.info(f"启用DataParallel模式，使用 {len(self.available_gpus)} 个GPU: {self.available_gpus}")
+                            logger.info(f"检测到 {len(self.available_gpus)} 个可用GPU: {self.available_gpus}")
+                            logger.info("将尝试使用DDP（DistributedDataParallel）进行多GPU训练")
                         else:
                             logger.info(f"使用单GPU训练: {self.device}")
                         
@@ -312,15 +313,26 @@ class KronosTrainingPipeline:
         
         self.is_master = True  # 单进程或主进程
         
-        # 设置分布式训练标志，避免重复检查
-        # 注意：如果使用DataParallel，则不使用DDP（两者互斥）
-        if self.use_data_parallel:
-            # 使用DataParallel时不使用DDP
-            self.use_ddp = False
-            logger.info(f"使用DataParallel进行多GPU训练，禁用DDP")
+        # 设置分布式训练标志 - 优先使用DDP以获得最佳性能
+        # DDP需要torchrun启动，如果环境变量不存在则回退到DataParallel
+        if use_gpu and self.gpu_type == "cuda" and len(self.available_gpus) > 1:
+            # 检查是否有DDP环境变量（由torchrun设置）
+            has_ddp_env = all(key in os.environ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
+            if has_ddp_env:
+                # 使用DDP（最快）
+                self.use_ddp = True
+                self.use_data_parallel = False
+                logger.info("检测到torchrun环境，将使用DDP（DistributedDataParallel）进行多GPU训练")
+            else:
+                # 回退到DataParallel（兼容性）
+                self.use_ddp = False
+                self.use_data_parallel = True
+                logger.warning("未检测到torchrun环境变量，回退到DataParallel模式")
+                logger.warning("提示：使用 torchrun 启动可获得更好的性能")
         else:
-            # 只有在未使用DataParallel且满足条件时才尝试DDP
-            self.use_ddp = (use_gpu and self.gpu_type == "cuda" and torch.cuda.device_count() > 1)
+            # 单GPU或CPU
+            self.use_ddp = False
+            self.use_data_parallel = False
         
         # 日志已在main函数中初始化，这里只记录信息
         logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}, DataParallel: {self.use_data_parallel}")

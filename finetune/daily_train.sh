@@ -105,6 +105,7 @@ NUM_WORKERS=16
 TORCH_THREADS=28
 EARLY_STOPPING_PATIENCE=3
 MAX_RETRIES=3
+NUM_GPUS=0  # GPU数量：0=使用所有可用GPU, 1=单GPU, 2+=指定GPU数量（需要torchrun）
 
 # 日志目录
 LOG_DIR="./logs"
@@ -215,18 +216,56 @@ train_model() {
     echo ""
     echo "开始训练..."
     echo "训练日志将写入: $TRAIN_LOG"
-    echo "执行命令: python main.py --data-source $DATA_SOURCE --model-version $MODEL_VERSION --top-k-stocks $TOP_K_STOCKS --num-workers $NUM_WORKERS --torch-threads $TORCH_THREADS --early-stopping-patience $EARLY_STOPPING_PATIENCE"
-    echo "注意: 默认使用GPU训练，如果GPU不可用会自动切换到CPU"
     
-    # 使用绝对路径执行python，确保找到正确的python
-    # 默认使用GPU，如果GPU不可用或出错会自动降级到CPU
-    "$PYTHON_PATH" main.py \
-        --data-source "$DATA_SOURCE" \
-        --model-version "$MODEL_VERSION" \
-        --top-k-stocks "$TOP_K_STOCKS" \
-        --num-workers "$NUM_WORKERS" \
-        --torch-threads "$TORCH_THREADS" \
-        --early-stopping-patience "$EARLY_STOPPING_PATIENCE" 2>&1
+    # 检测可用GPU数量
+    if command -v nvidia-smi &> /dev/null; then
+        AVAILABLE_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+        echo "检测到 $AVAILABLE_GPUS 个GPU"
+    else
+        AVAILABLE_GPUS=0
+        echo "未检测到nvidia-smi命令，将使用CPU训练"
+    fi
+    
+    # 决定使用的GPU数量
+    if [ "$NUM_GPUS" -eq 0 ]; then
+        # 使用所有可用GPU
+        ACTUAL_NUM_GPUS=$AVAILABLE_GPUS
+    else
+        # 使用指定数量的GPU
+        ACTUAL_NUM_GPUS=$NUM_GPUS
+    fi
+    
+    # 构建训练命令
+    if [ "$ACTUAL_NUM_GPUS" -gt 1 ]; then
+        # 多GPU训练：使用torchrun启动DDP
+        echo "使用DDP（DistributedDataParallel）多GPU训练模式"
+        echo "GPU数量: $ACTUAL_NUM_GPUS"
+        echo "执行命令: torchrun --standalone --nproc_per_node=$ACTUAL_NUM_GPUS main.py ..."
+        
+        torchrun --standalone --nproc_per_node="$ACTUAL_NUM_GPUS" main.py \
+            --data-source "$DATA_SOURCE" \
+            --model-version "$MODEL_VERSION" \
+            --top-k-stocks "$TOP_K_STOCKS" \
+            --num-workers "$NUM_WORKERS" \
+            --torch-threads "$TORCH_THREADS" \
+            --early-stopping-patience "$EARLY_STOPPING_PATIENCE" 2>&1
+    else
+        # 单GPU或CPU训练：直接使用python
+        if [ "$ACTUAL_NUM_GPUS" -eq 1 ]; then
+            echo "使用单GPU训练模式"
+        else
+            echo "使用CPU训练模式"
+        fi
+        echo "执行命令: python main.py ..."
+        
+        "$PYTHON_PATH" main.py \
+            --data-source "$DATA_SOURCE" \
+            --model-version "$MODEL_VERSION" \
+            --top-k-stocks "$TOP_K_STOCKS" \
+            --num-workers "$NUM_WORKERS" \
+            --torch-threads "$TORCH_THREADS" \
+            --early-stopping-patience "$EARLY_STOPPING_PATIENCE" 2>&1
+    fi
     
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
