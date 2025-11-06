@@ -634,14 +634,17 @@ class KronosTrainingPipeline:
         last_test_loss = float('inf')  # 上次测试损失
         
         for epoch_idx in range(self.config.epochs):
+            logger.info(f"[Rank {self.rank}] 开始 Tokenizer Epoch {epoch_idx + 1}/{self.config.epochs}")
             epoch_start_time = time.time()
             model.train()
             
             # 设置数据集种子
             if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+                logger.info(f"[Rank {self.rank}] 设置sampler epoch: {epoch_idx}")
                 train_loader.sampler.set_epoch(epoch_idx)
             train_dataset.set_epoch_seed(epoch_idx * 10000 + (self.rank if self.use_gpu else 0))
             valid_dataset.set_epoch_seed(0)  # 保持验证采样一致
+            logger.info(f"[Rank {self.rank}] 数据集种子设置完成，准备开始训练循环")
             
             # 训练循环
             for i, (ori_batch_x, _) in enumerate(train_loader):
@@ -778,6 +781,14 @@ class KronosTrainingPipeline:
                     if comet_logger:
                         comet_logger.log_model("best_model", save_path)
             
+            # 在分布式训练中，同步test_loss到所有进程
+            if self.use_ddp and hasattr(self, 'test_data') and self.test_data is not None:
+                logger.info(f"[Rank {self.rank}] 同步test_loss: {self.best_tokenizer_test_loss}")
+                test_loss_tensor = torch.tensor([self.best_tokenizer_test_loss], device=self.device)
+                dist.broadcast(test_loss_tensor, src=0)
+                self.best_tokenizer_test_loss = test_loss_tensor.item()
+                logger.info(f"[Rank {self.rank}] 同步后test_loss: {self.best_tokenizer_test_loss}")
+            
             # 基于测试集的提前终止逻辑
             if hasattr(self, 'test_data') and self.test_data is not None:
                 # 如果有测试数据，检查测试损失是否改善
@@ -800,7 +811,9 @@ class KronosTrainingPipeline:
             
             # 同步所有进程
             if self.use_ddp:
+                logger.info(f"[Rank {self.rank}] Tokenizer训练epoch结束，到达同步点")
                 dist.barrier()
+                logger.info(f"[Rank {self.rank}] Tokenizer训练epoch同步完成")
         
         # 保存训练摘要
         if self.is_master:
@@ -1091,6 +1104,14 @@ class KronosTrainingPipeline:
                     if comet_logger:
                         comet_logger.log_model("best_model", save_path)
             
+            # 在分布式训练中，同步test_loss到所有进程
+            if self.use_ddp and hasattr(self, 'test_data') and self.test_data is not None:
+                logger.info(f"[Rank {self.rank}] 同步predictor test_loss: {self.best_predictor_test_loss}")
+                test_loss_tensor = torch.tensor([self.best_predictor_test_loss], device=self.device)
+                dist.broadcast(test_loss_tensor, src=0)
+                self.best_predictor_test_loss = test_loss_tensor.item()
+                logger.info(f"[Rank {self.rank}] 同步后predictor test_loss: {self.best_predictor_test_loss}")
+            
             # 基于测试集的提前终止逻辑
             if hasattr(self, 'test_data') and self.test_data is not None:
                 # 如果有测试数据，检查测试损失是否改善
@@ -1113,7 +1134,9 @@ class KronosTrainingPipeline:
             
             # 同步所有进程
             if self.use_ddp:
+                logger.info(f"[Rank {self.rank}] Predictor训练epoch结束，到达同步点")
                 dist.barrier()
+                logger.info(f"[Rank {self.rank}] Predictor训练epoch同步完成")
         
         # 保存训练摘要
         if self.is_master:

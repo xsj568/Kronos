@@ -105,7 +105,7 @@ NUM_WORKERS=16
 TORCH_THREADS=28
 EARLY_STOPPING_PATIENCE=3
 MAX_RETRIES=3
-NUM_GPUS=0  # GPU数量：0=使用所有可用GPU, 1=单GPU, 2+=指定GPU数量（需要torchrun）
+NUM_GPUS=1  # GPU数量：0=使用所有可用GPU, 1=单GPU(推荐), 2+=指定GPU数量（需要torchrun，可能有DDP卡顿问题）
 
 # 日志目录
 LOG_DIR="./logs"

@@ -20,14 +20,18 @@ def setup_ddp():
     if not dist.is_available():
         raise RuntimeError("torch.distributed is not available.")
 
-    dist.init_process_group(backend="nccl")
+    # Set timeout to 30 minutes to support time-consuming data processing operations
+    # Default is 10 minutes, but data processing (especially stock activity evaluation) may take longer
+    timeout = datetime.timedelta(minutes=30)
+    dist.init_process_group(backend="nccl", timeout=timeout)
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     print(
         f"[DDP Setup] Global Rank: {rank}/{world_size}, "
-        f"Local Rank (GPU): {local_rank} on device {torch.cuda.current_device()}"
+        f"Local Rank (GPU): {local_rank} on device {torch.cuda.current_device()}, "
+        f"Timeout: {timeout.total_seconds()}s"
     )
     return rank, world_size, local_rank
 
