@@ -237,10 +237,10 @@ class OptimizedConfig:
     def _init_training_config(self):
         """初始化训练相关配置"""
         # 训练超参数
-        self.epochs = 30
-        self.batch_size = 50
+        self.epochs = 10  # 从30减少到10，可减少66%训练时间
+        self.batch_size = 100  # 从50增加到100，可加快训练速度
         self.log_interval = 100  # Log training status every N batches
-        self.accumulation_steps = 10
+        self.accumulation_steps = 5  # 从10减少到5，减少内存累积次数
         
         # 学习率配置
         self.tokenizer_learning_rate = 2e-4
@@ -256,7 +256,7 @@ class OptimizedConfig:
         self.n_val_iter = 40
         
         # 提前终止配置
-        self.early_stopping_patience = 6
+        self.early_stopping_patience = 3  # 从6减少到3，加快早停
         
         # CPU多核优化配置
         self.num_workers = 4  # DataLoader的worker数量，默认4（优化后的值，避免创建过多子进程）
@@ -270,8 +270,8 @@ class OptimizedConfig:
         self.use_all_available_gpus = True  # 是否使用所有符合条件的GPU（用于DataParallel）
         
         # 股票选择配置
-        self.top_k_stocks = 1000  # 选择TopK活跃股票数量，默认1000
-        self.stock_selection_days = 365  # 基于最近N天的数据选择股票，默认365天（一年）
+        self.top_k_stocks = 500  # 选择TopK活跃股票数量，从1000减少到500，可减少50%训练数据
+        self.stock_selection_days = 180  # 基于最近N天的数据选择股票，从365减少到180天（半年），加快股票选择速度
         self.stock_cache_file = None  # 股票代码缓存文件名（自动根据top_k生成: selected_stocks_{top_k}.json）
         self.use_stock_cache = True  # 是否使用缓存的股票列表（True: 从缓存读取, False: 重新选择）
     
