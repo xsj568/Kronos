@@ -93,6 +93,31 @@ def safe_loss_item(loss):
         return loss.mean().item()
 
 
+def format_duration(seconds: float) -> str:
+    """
+    将秒数格式化为天-小时-分钟格式
+    
+    Args:
+        seconds: 总秒数
+        
+    Returns:
+        str: 格式化的时间字符串（例如"1天2小时30分钟"或"2小时30分钟"或"30分钟"）
+    """
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    
+    parts = []
+    if days > 0:
+        parts.append(f"{days}天")
+    if hours > 0:
+        parts.append(f"{hours}小时")
+    if minutes > 0 or len(parts) == 0:  # 至少显示分钟
+        parts.append(f"{minutes}分钟")
+    
+    return "".join(parts)
+
+
 def check_and_kill_existing_processes():
     """检查并清理已存在的训练进程（只清理同一目录下的 main.py）"""
     current_pid = os.getpid()
@@ -1379,18 +1404,24 @@ class KronosTrainingPipeline:
     
     def run_pipeline(self):
         """运行完整训练流水线，支持GPU失败时自动降级到CPU"""
+        pipeline_start_time = time.time()
+        time_stats = {}  # 记录各阶段耗时
+        
         try:
             # 设置分布式环境（如果使用CUDA多GPU）
             if self.use_ddp:
                 self.setup_distributed()
             
             # 处理数据并加载测试数据
+            step_start = time.time()
             if not self.process_data():
                 logger.error("数据处理失败，流水线终止")
                 return False
+            time_stats['数据处理'] = time.time() - step_start
             
             # 训练分词模型（每轮评估并保存最佳模型）
             # 如果GPU训练失败，自动切换到CPU重试
+            step_start = time.time()
             try:
                 if not self.train_tokenizer():
                     logger.error("分词模型训练失败，流水线终止")
@@ -1409,9 +1440,11 @@ class KronosTrainingPipeline:
                         raise
                 else:
                     raise
+            time_stats['分词模型训练'] = time.time() - step_start
             
             # 训练预测模型（每轮评估并保存最佳模型）
             # 如果GPU训练失败，自动切换到CPU重试
+            step_start = time.time()
             try:
                 if not self.train_predictor():
                     logger.error("预测模型训练失败，流水线终止")
@@ -1430,16 +1463,24 @@ class KronosTrainingPipeline:
                         raise
                 else:
                     raise
+            time_stats['预测模型训练'] = time.time() - step_start
             
             # 验证最佳模型是否已正确选择
+            step_start = time.time()
             if not self.evaluate_models():
                 logger.error("模型验证失败，流水线终止")
                 return False
+            time_stats['模型验证'] = time.time() - step_start
             
             # 使用最佳模型进行预测
+            step_start = time.time()
             if not self.predict():
                 logger.error("预测失败，流水线终止")
                 return False
+            time_stats['预测'] = time.time() - step_start
+            
+            # 计算总耗时
+            total_time = time.time() - pipeline_start_time
             
             if self.is_master:
                 logger.info("完整训练流水线执行成功")
@@ -1462,6 +1503,14 @@ class KronosTrainingPipeline:
                         logger.info(f"历史最佳预测模型路径: {predictor_path}")
                 else:
                     logger.warning("更新历史最佳模型路径失败")
+                
+                # 打印时间统计（放在最后）
+                logger.info("\n" + "=" * 60)
+                logger.info("各阶段耗时统计:")
+                for stage_name, duration in time_stats.items():
+                    logger.info(f"  {stage_name}: {format_duration(duration)}")
+                logger.info(f"  总耗时: {format_duration(total_time)}")
+                logger.info("=" * 60)
             
             # 清理分布式环境
             if self.use_ddp:
