@@ -535,6 +535,8 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
     """
     使用训练好的模型预测未来股票走势
     
+    根据每支股票的最新数据日期，预测其下一个交易日的结果
+    
     Args:
         tokenizer: 分词模型
         model: 预测模型
@@ -550,6 +552,12 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
     try:
         # 所有需要的模块已在文件顶部导入
         
+        # 获取预测生成日期（使用上海时间的今天）
+        shanghai_time = get_shanghai_time()
+        prediction_generation_date = shanghai_time.date()  # 预测生成日期（今天）
+        logger.info(f"预测生成日期: {prediction_generation_date}")
+        logger.info(f"每支股票将基于其最新数据日期预测下一个交易日")
+        
         # 创建预测数据集
         class PredictionDataset(torch.utils.data.Dataset):
             def __init__(self, data, config):
@@ -560,7 +568,7 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                 self.time_feature_list = config.time_feature_list
                 self.indices = []
                 
-                # 为每个股票准备最新的数据窗口
+                # 为每个股票准备最新的数据窗口和未来日期
                 for symbol in self.symbols:
                     df = self.data[symbol].reset_index()
                     # 只使用最新的lookback_window天数据
@@ -575,24 +583,25 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                         
                         # 使用最新的数据窗口
                         start_idx = len(df) - config.lookback_window
-                        timestamp = df.iloc[-1]['datetime']
-                        self.indices.append((symbol, start_idx, timestamp))
+                        last_date = df.iloc[-1]['datetime']  # 该股票的最新数据日期
+                        
+                        # 基于该股票的最新日期计算未来交易日
+                        future_dates = get_future_business_days(last_date, config.predict_window)
+                        
+                        self.indices.append((symbol, start_idx, last_date, future_dates))
             
             def __len__(self):
                 return len(self.indices)
             
             def __getitem__(self, idx):
-                symbol, start_idx, timestamp = self.indices[idx]
+                symbol, start_idx, last_date, future_dates = self.indices[idx]
                 df = self.data[symbol]
                 
                 # 获取上下文窗口
                 context_end = start_idx + self.config.lookback_window
                 context_df = df.iloc[start_idx:context_end]
                 
-                # 生成未来10个工作日的时间戳特征
-                last_date = context_df.iloc[-1]['datetime']
-                future_dates = get_future_business_days(last_date, self.config.predict_window)
-                
+                # 使用该股票特定的未来日期
                 # 将 date 对象转换为 datetime 对象（设置时间为 00:00:00）
                 from datetime import datetime as dt_datetime
                 future_datetimes = [
@@ -619,18 +628,19 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                 x = (x - x_mean) / (x_std + 1e-5)
                 x = np.clip(x, -self.config.clip, self.config.clip)
                 
-                return torch.from_numpy(x), torch.from_numpy(x_stamp), torch.from_numpy(y_stamp), symbol, timestamp
+                # 返回数据，包括最后日期和未来日期
+                return torch.from_numpy(x), torch.from_numpy(x_stamp), torch.from_numpy(y_stamp), symbol, last_date, future_dates
         
         # 创建预测数据集和数据加载器
         pred_dataset = PredictionDataset(test_data, config)
         
         # 定义collate函数
         def collate_fn(batch):
-            x, x_stamp, y_stamp, symbols, timestamps = zip(*batch)
+            x, x_stamp, y_stamp, symbols, last_dates, future_dates_list = zip(*batch)
             x_batch = torch.stack(x, dim=0)
             x_stamp_batch = torch.stack(x_stamp, dim=0)
             y_stamp_batch = torch.stack(y_stamp, dim=0)
-            return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(timestamps)
+            return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(last_dates), list(future_dates_list)
         
         pred_loader = torch.utils.data.DataLoader(
             pred_dataset,
@@ -645,7 +655,7 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
         detailed_results = []  # 存储详细的预测结果
         
         with torch.no_grad():
-            for x, x_stamp, y_stamp, symbols, timestamps in pred_loader:
+            for x, x_stamp, y_stamp, symbols, last_dates, future_dates_list in pred_loader:
                 # 使用自回归推理进行预测
                 preds = auto_regressive_inference(
                     tokenizer, model, x.to(device), x_stamp.to(device), y_stamp.to(device),
@@ -690,14 +700,17 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                 # 收集结果
                 for i in range(len(symbols)):
                     for sig_type, sig_values in signals.items():
-                        results[sig_type].append((timestamps[i], symbols[i], sig_values[i]))
+                        results[sig_type].append((last_dates[i], symbols[i], sig_values[i]))
                     
                     # 收集详细预测结果（每支股票未来N天的所有特征预测）
                     symbol = symbols[i]
+                    last_date = last_dates[i]
+                    future_dates = future_dates_list[i]
                     
                     # 为每支股票创建一个详细记录
                     detail_record = {
                         'stock_code': symbol,
+                        'last_data_date': last_date.strftime('%Y-%m-%d'),  # 最新数据日期
                         'current_open': last_day_features['open'][i],
                         'current_high': last_day_features['high'][i],
                         'current_low': last_day_features['low'][i],
@@ -706,9 +719,7 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                         'current_amount': last_day_features['amount'][i],
                     }
                     
-                    # 获取未来日期
-                    last_date = timestamps[i]
-                    future_dates = get_future_business_days(last_date, config.predict_window)
+                    # 使用该股票特定的未来日期
                     
                     # 添加未来每一天的所有特征预测
                     for day_idx in range(config.predict_window):

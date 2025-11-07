@@ -1351,17 +1351,22 @@ class KronosTrainingPipeline:
             
             logger.info("✓ 详细预测完成")
             
-            # ========== 2. 简化预测：只预测下一个工作日并增量更新 ==========
+            # ========== 2. 增量预测：提取下一个交易日预测并累积保存 ==========
+            # 说明：
+            # - 模型预测了未来多天，但为了效果评估，只保存第一天（最准确）
+            # - 每次运行都会累积保存到 predictions_master.xlsx
+            # - 后续可以对比预测值和真实值，评估模型效果
             logger.info("\n" + "=" * 60)
-            logger.info("执行简化预测：预测下一个工作日涨跌幅...")
+            logger.info("提取下一个交易日预测结果并累积保存...")
             logger.info("=" * 60)
             
             # 从详细预测结果中提取第一天的预测
             if 'detailed' in prediction_dfs and not prediction_dfs['detailed'].empty:
                 detailed_df = prediction_dfs['detailed']
                 
-                # 只保留第一天的预测数据
-                next_day_columns = ['stock_code', 
+                # 提取下一个交易日（day_1）的预测数据
+                # 包含：股票代码、最新数据日期、当前价格、预测价格、预测涨跌幅
+                next_day_columns = ['stock_code', 'last_data_date',
                                    'current_open', 'current_high', 'current_low', 'current_close', 'current_volume',
                                    'day_1_date', 'day_1_open', 'day_1_high', 'day_1_low', 'day_1_close', 'day_1_volume',
                                    'day_1_open_change_pct', 'day_1_high_change_pct', 'day_1_low_change_pct', 
@@ -1373,12 +1378,14 @@ class KronosTrainingPipeline:
                 master_excel_path = os.path.join(save_dir, "predictions_master.xlsx")
                 updater = PredictionIncrementalUpdater(master_excel_path)
                 
-                # 获取预测日期（使用上海时间）
+                # 获取预测生成日期（使用上海时间）
                 shanghai_time = get_shanghai_time()
                 prediction_date = shanghai_time.strftime('%Y-%m-%d')
                 
-                # 追加到主Excel文件
-                logger.info(f"将预测结果追加到主Excel文件: {master_excel_path}")
+                # 累积追加到主Excel文件（增量更新，不覆盖历史数据）
+                logger.info(f"将预测结果累积追加到主Excel文件: {master_excel_path}")
+                logger.info(f"  - 本次预测股票数: {len(next_day_prediction)}")
+                logger.info(f"  - 预测生成日期: {prediction_date}")
                 success = updater.append_daily_predictions(next_day_prediction, prediction_date)
                 
                 if success:

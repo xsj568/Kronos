@@ -51,8 +51,9 @@ class PredictionIncrementalUpdater:
         if not os.path.exists(self.master_excel_path):
             # 创建空的DataFrame并保存
             df = pd.DataFrame(columns=[
-                '生成日期',  # 何时生成的预测
-                '目标日期',  # 预测的是哪一天
+                '生成日期',  # 何时生成的预测（今天）
+                '最新日期',  # 股票的最新数据日期
+                '预测日期',  # 预测的目标日期（最新日期的下一个交易日）
                 '股票代码',
                 # 预测值
                 '预测开盘价',
@@ -120,8 +121,9 @@ class PredictionIncrementalUpdater:
             
             for _, row in prediction_data.iterrows():
                 record = {
-                    '生成日期': prediction_date,  # 预测生成日期
-                    '目标日期': row.get('day_1_date', ''),  # 预测目标日期
+                    '生成日期': prediction_date,  # 预测生成日期（今天）
+                    '最新日期': row.get('last_data_date', ''),  # 股票的最新数据日期
+                    '预测日期': row.get('day_1_date', ''),  # 预测目标日期（最新日期的下一个交易日）
                     '股票代码': row.get('stock_code', ''),
                     # 预测值
                     '预测开盘价': row.get('day_1_open', 0),
@@ -153,9 +155,13 @@ class PredictionIncrementalUpdater:
             # 合并数据
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
             
-            # 按生成日期和目标日期降序排列（最新的在前面）
+            # 按生成日期、最新日期、预测日期降序排列（最新的在前面）
             if not combined_df.empty:
-                combined_df = combined_df.sort_values(['生成日期', '目标日期'], ascending=False).reset_index(drop=True)
+                sort_columns = ['生成日期', '最新日期', '预测日期']
+                # 只按存在的列排序
+                sort_columns = [col for col in sort_columns if col in combined_df.columns]
+                if sort_columns:
+                    combined_df = combined_df.sort_values(sort_columns, ascending=False).reset_index(drop=True)
             
             # 保存到Excel
             with pd.ExcelWriter(self.master_excel_path, engine='openpyxl') as writer:
@@ -185,15 +191,16 @@ class PredictionIncrementalUpdater:
             if data_df.empty:
                 return
             
-            # 按目标日期统计
-            if '目标日期' in data_df.columns:
-                summary_by_date = data_df.groupby('目标日期').agg({
+            # 按预测日期统计
+            date_col = '预测日期' if '预测日期' in data_df.columns else '目标日期'
+            if date_col in data_df.columns:
+                summary_by_date = data_df.groupby(date_col).agg({
                     '股票代码': 'count',
                     '预测收盘涨跌幅(%)': ['mean', 'std', 'min', 'max']
                 }).reset_index()
                 
                 summary_by_date.columns = [
-                    '目标日期',
+                    '预测日期',
                     '股票数量',
                     '平均预测涨跌幅(%)',
                     '涨跌幅标准差',
