@@ -189,26 +189,26 @@ echo "  - 线程数: $TORCH_THREADS"
 echo "  - 最大重试: $MAX_RETRIES"
 echo ""
 
-# 检查并自动杀掉正在运行的训练进程
-if pgrep -f "python main.py" > /dev/null; then
-    echo "警告：检测到正在运行的训练进程"
-    echo "进程列表："
-    ps aux | grep "python main.py" | grep -v grep
-    echo ""
-    echo "正在停止旧进程..."
+# 检查并自动清理旧训练进程
+LOCK_FILE="training.lock"
+if [ -f "$LOCK_FILE" ]; then
+    echo "检测到训练锁文件，正在清理旧进程..."
     
-    # 自动杀掉所有正在运行的训练进程
-    pkill -9 -f "python main.py" || true
-    sleep 3
-    
-    # 再次检查是否还有残留进程
-    if pgrep -f "python main.py" > /dev/null; then
-        echo "警告：仍有进程残留，尝试强制终止..."
-        pkill -9 -f "main.py" || true
-        sleep 2
+    # 调用 kill_training.sh 强制终止旧进程
+    if [ -f "./kill_training.sh" ]; then
+        bash ./kill_training.sh --force
+        if [ $? -eq 0 ]; then
+            echo "✓ 旧进程已清理"
+        else
+            echo "✗ 清理旧进程失败"
+            exit 1
+        fi
+    else
+        echo "✗ 错误: kill_training.sh 不存在"
+        exit 1
     fi
     
-    echo "✓ 已停止旧进程"
+    echo ""
 fi
 
 # 训练函数

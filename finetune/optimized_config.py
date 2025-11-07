@@ -239,7 +239,8 @@ class OptimizedConfig:
         # 训练超参数
         self.epochs = 10  # 从30减少到10，可减少66%训练时间
         self.batch_size = 100  # 从50增加到100，可加快训练速度
-        self.log_interval = 100  # Log training status every N batches
+        self.log_interval = 100  # Log training status every N batches（已废弃，改用max_logs_per_epoch）
+        self.max_logs_per_epoch = 30  # 每个epoch最多打印的日志次数（智能计算实际间隔）
         self.accumulation_steps = 5  # 从10减少到5，减少内存累积次数
         
         # 学习率配置
@@ -584,7 +585,9 @@ def parse_args():
     
     # 训练日志参数
     parser.add_argument('--log-interval', type=int, default=1,
-                        help='训练日志记录间隔（每N个batch记录一次），设置为1可实时查看训练进度（默认100）')
+                        help='训练日志记录间隔（已废弃，建议使用--max-logs-per-epoch）')
+    parser.add_argument('--max-logs-per-epoch', type=int, default=30,
+                        help='每个epoch最多打印的日志次数，自动计算实际间隔（默认30）')
     
     return parser.parse_args()
 
@@ -622,7 +625,8 @@ def create_config_from_args(args) -> OptimizedConfig:
         stock_selection_days=args.stock_selection_days,
         use_stock_cache=not args.no_stock_cache,
         # 训练日志参数
-        log_interval=args.log_interval
+        log_interval=args.log_interval,
+        max_logs_per_epoch=args.max_logs_per_epoch
     )
     
     return config

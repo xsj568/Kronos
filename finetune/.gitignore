@@ -1,0 +1,55 @@
+# 训练锁文件
+training.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 数据文件
+data/
+*.pkl
+*.csv
+*.parquet
+
+# 模型输出
+outputs/
+checkpoints/
+*.pth
+*.ckpt
+
+# 日志
+logs/
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 环境
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+*.cache
+

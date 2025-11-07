@@ -72,7 +72,7 @@ from utils.gpu_utils import (
 logger = logging.getLogger('KronosPipeline')
 
 # 全局进程锁文件
-LOCK_FILE = '/tmp/kronos_training.lock'
+LOCK_FILE = 'training.lock'
 lock_fd = None
 _cleanup_done = False  # 防止重复清理的标志
 
@@ -508,12 +508,31 @@ class KronosTrainingPipeline:
         success = True
         
         if self.is_master:
-            logger.info(f"开始处理{self.data_source}数据...")
             try:
-                # 使用工厂创建数据处理器
-                processor = DataProcessorFactory.create_processor(self.data_source, self.config)
-                result = processor.run_pipeline()
-                logger.info(f"数据处理完成: {result}")
+                # 检查数据是否已存在
+                train_path = os.path.join(self.config.dataset_path, self.data_source, "train_data.pkl")
+                val_path = os.path.join(self.config.dataset_path, self.data_source, "val_data.pkl")
+                test_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
+                
+                # 判断是否需要下载数据
+                data_exists = all(os.path.exists(p) for p in [train_path, val_path, test_path])
+                should_download = self.config.force_download_data or not data_exists
+                
+                if data_exists and not self.config.force_download_data:
+                    logger.info(f"检测到已存在的{self.data_source}数据文件，跳过下载和处理")
+                    logger.info(f"数据存储路径:")
+                    logger.info(f"  - 训练数据: {train_path}")
+                    logger.info(f"  - 验证数据: {val_path}")
+                    logger.info(f"  - 测试数据: {test_path}")
+                    logger.info(f"如需重新下载数据，请使用 --force_download_data 参数或删除上述文件")
+                else:
+                    if self.config.force_download_data:
+                        logger.info(f"强制重新下载数据 (force_download_data=True)")
+                    logger.info(f"开始处理{self.data_source}数据...")
+                    # 使用工厂创建数据处理器
+                    processor = DataProcessorFactory.create_processor(self.data_source, self.config)
+                    result = processor.run_pipeline()
+                    logger.info(f"数据处理完成: {result}")
                 
                 # 加载测试数据，用于每个训练阶段的评估
                 self.load_test_data()
@@ -651,6 +670,12 @@ class KronosTrainingPipeline:
         # 设置Comet日志记录器
         comet_logger = setup_comet_logger(self.config.__dict__) if self.is_master else None
         
+        # 计算智能日志间隔（确保每个epoch最多打印指定次数）
+        max_logs_per_epoch = getattr(self.config, 'max_logs_per_epoch', 30)
+        actual_log_interval = max(1, len(train_loader) // max_logs_per_epoch)
+        if self.is_master:
+            logger.info(f"训练配置: 总步数={len(train_loader)}, 日志间隔={actual_log_interval}, 预计每epoch打印{len(train_loader)//actual_log_interval}次日志")
+        
         # 训练循环
         best_val_loss = float('inf')
         batch_idx_global_train = 0
@@ -710,7 +735,7 @@ class KronosTrainingPipeline:
                 optimizer.zero_grad()
                 
                 # 日志记录
-                if self.is_master and (batch_idx_global_train + 1) % self.config.log_interval == 0:
+                if self.is_master and (batch_idx_global_train + 1) % actual_log_interval == 0:
                     avg_loss = current_batch_total_loss / self.config.accumulation_steps
                     logger.info(
                         f"[Epoch {epoch_idx + 1}/{self.config.epochs}, Step {i + 1}/{len(train_loader)}] "
@@ -969,6 +994,12 @@ class KronosTrainingPipeline:
         # 设置Comet日志记录器
         comet_logger = setup_comet_logger(self.config.__dict__) if self.is_master else None
         
+        # 计算智能日志间隔（确保每个epoch最多打印指定次数）
+        max_logs_per_epoch = getattr(self.config, 'max_logs_per_epoch', 30)
+        actual_log_interval = max(1, len(train_loader) // max_logs_per_epoch)
+        if self.is_master:
+            logger.info(f"训练配置: 总步数={len(train_loader)}, 日志间隔={actual_log_interval}, 预计每epoch打印{len(train_loader)//actual_log_interval}次日志")
+        
         # 训练循环
         best_val_loss = float('inf')
         batch_idx_global = 0
@@ -1023,7 +1054,7 @@ class KronosTrainingPipeline:
                 scheduler.step()
                 
                 # 日志记录
-                if self.is_master and (batch_idx_global + 1) % self.config.log_interval == 0:
+                if self.is_master and (batch_idx_global + 1) % actual_log_interval == 0:
                     lr = optimizer.param_groups[0]['lr']
                     logger.info(
                         f"[Epoch {epoch_idx + 1}/{self.config.epochs}, Step {i + 1}/{len(train_loader)}] "
