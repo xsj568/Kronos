@@ -168,6 +168,12 @@ class DateRotatingFileHandler(logging.FileHandler):
         
         # 调用父类方法写入日志
         super().emit(record)
+        # 立即刷新日志，确保日志及时写入文件，避免看起来卡住
+        try:
+            if self.stream:
+                self.stream.flush()
+        except Exception:
+            pass
 
 def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, data_source=None, model_version=None):
     """
@@ -250,6 +256,10 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(formatter)
+    # 设置控制台输出立即刷新，避免日志卡住
+    import sys
+    if hasattr(sys.stdout, 'flush'):
+        console_handler.flush = lambda: sys.stdout.flush()
     root_logger.addHandler(console_handler)
     
     # 保存配置参数
@@ -271,6 +281,8 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     )
     file_handler.setLevel(log_level)
     file_handler.setFormatter(formatter)
+    # 设置日志立即刷新，避免日志卡住
+    file_handler.flush = lambda: file_handler.stream.flush() if file_handler.stream else None
     root_logger.addHandler(file_handler)
     
     # 标记为已初始化并保存logger实例和日期信息
@@ -436,8 +448,23 @@ def create_dataloaders_cpu(config: dict):
     logger.info(f"[CPU] 训练数据集大小: {len(train_dataset)}, 验证数据集大小: {len(valid_dataset)}")
 
     num_workers = config.get('num_workers', 0) or 0
+    
+    # 如果使用 DataParallel，必须将 num_workers 设置为 0，否则会导致死锁
+    # DataParallel 本身会创建多个进程，如果再使用多 worker 的 DataLoader，会导致进程间通信问题
+    use_data_parallel = config.get('use_data_parallel', False)
+    if use_data_parallel and num_workers > 0:
+        logger.warning(f"检测到使用 DataParallel 模式，将 num_workers 从 {num_workers} 调整为 0 以避免死锁")
+        num_workers = 0
+    
     pin_memory = False  # 在CPU上，pin_memory没有好处
 
+    # DataParallel模式下，添加multiprocessing_context='spawn'可以避免某些死锁问题
+    # 但num_workers=0时不需要设置
+    mp_context = None
+    if num_workers > 0:
+        import multiprocessing
+        mp_context = multiprocessing.get_context('spawn')
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
@@ -445,6 +472,8 @@ def create_dataloaders_cpu(config: dict):
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
+        multiprocessing_context=mp_context,
+        persistent_workers=False,  # DataParallel模式下禁用persistent_workers
     )
 
     val_loader = DataLoader(
@@ -454,6 +483,8 @@ def create_dataloaders_cpu(config: dict):
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        multiprocessing_context=mp_context,
+        persistent_workers=False,
     )
 
     logger.info(f"[CPU] 数据加载器创建完成。每轮训练步数: {len(train_loader)}, 验证步数: {len(val_loader)}")

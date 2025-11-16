@@ -173,7 +173,7 @@ class SinaDataProcessor(BaseDataProcessor):
         # 构建缓存文件完整路径
         cache_path = Path(__file__).parent / cache_file
         
-        # 1. 尝试从缓存加载
+        # 1. 优先从缓存文件加载（如果存在且匹配配置）
         if use_cache and cache_path.exists():
             try:
                 with open(cache_path, 'r', encoding='utf-8') as f:
@@ -191,12 +191,14 @@ class SinaDataProcessor(BaseDataProcessor):
                     logger.info(f"  缓存日期: {cached_date_str}")
                     logger.info(f"  加载 {len(cached_symbols)} 支股票")
                     
-                    # 如果配置的top_k比缓存的少，只返回前top_k个
-                    if top_k < len(cached_symbols):
-                        logger.info(f"  当前配置top_k={top_k}，从缓存中取前{top_k}支股票")
-                        return cached_symbols[:top_k]
-                    
-                    return cached_symbols
+                    # 如果缓存中的股票数量匹配或超过配置的top_k，直接使用
+                    if cached_top_k == top_k or len(cached_symbols) >= top_k:
+                        if top_k < len(cached_symbols):
+                            logger.info(f"  当前配置top_k={top_k}，从缓存中取前{top_k}支股票")
+                            return cached_symbols[:top_k]
+                        return cached_symbols
+                    else:
+                        logger.info(f"  缓存中的股票数量({len(cached_symbols)})少于配置的top_k({top_k})，将重新选择")
             except Exception as e:
                 logger.warning(f"加载缓存文件失败: {e}，将重新选择股票")
         
@@ -365,23 +367,13 @@ class SinaDataProcessor(BaseDataProcessor):
         
         logger.info(f"评估完成：从 {len(symbols_to_check)} 支中找到 {len(stock_scores)} 支有效股票")
         
-        # 如果有效股票不足top_k，用未检查的股票随机补充
-        if len(stock_scores) < top_k:
-            logger.warning(f"有效股票数量({len(stock_scores)})少于top_k({top_k})，随机补充")
-            remaining_symbols = [s for s in symbols if s not in stock_scores]
-            random.shuffle(remaining_symbols)
-            additional_count = top_k - len(stock_scores)
-            additional = remaining_symbols[:additional_count]
-            
-            # 给补充的股票一个较低的默认分数
-            for sym in additional:
-                stock_scores[sym] = {'score': 0, 'avg_volume': 0, 'completeness': 0, 'data_points': 0}
-            
-            logger.info(f"  随机补充了 {len(additional)} 支股票")
-        
-        # 按评分排序，选择TopK
+        # 按评分排序，选择TopK（不补齐，有多少用多少）
         sorted_stocks = sorted(stock_scores.items(), key=lambda x: x[1]['score'], reverse=True)
-        selected_symbols = [s[0] for s in sorted_stocks[:top_k]]
+        available_count = min(len(sorted_stocks), top_k)
+        selected_symbols = [s[0] for s in sorted_stocks[:available_count]]
+        
+        if len(selected_symbols) < top_k:
+            logger.warning(f"有效股票数量({len(selected_symbols)})少于top_k({top_k})，使用实际找到的 {len(selected_symbols)} 支股票（不补齐）")
         
         # 输出TopK统计信息
         if len(sorted_stocks) > 0:
@@ -908,6 +900,21 @@ class FinancialDataset(Dataset):
         # Use a dedicated random number generator for sampling to avoid
         # interfering with other random processes (e.g., in model initialization).
         self.py_rng = random.Random(self.config.seed)
+        
+        # 注意：线程锁无法在多进程DataLoader中序列化（pickle）
+        # 只有在单线程（num_workers=0）或DataParallel多线程环境下才需要锁
+        # 对于多进程DataLoader，每个进程有独立的dataset实例，不需要锁
+        import threading
+        # 检查是否使用多进程DataLoader
+        num_workers = getattr(self.config, 'num_workers', 0) or 0
+        if num_workers == 0:
+            # 单线程模式，使用锁保护（用于DataParallel多线程场景）
+            self._lock = threading.Lock()
+            self._use_lock = True
+        else:
+            # 多进程模式，不使用锁（每个进程有独立实例）
+            self._lock = None
+            self._use_lock = False
 
         # 获取数据来源
         self.data_source = getattr(self.config, 'data_source', 'qlib')
@@ -990,7 +997,13 @@ class FinancialDataset(Dataset):
                 - x_stamp_tensor (torch.Tensor): The time feature tensor.
         """
         # Select a random sample from the entire pool of indices.
-        random_idx = self.py_rng.randint(0, len(self.indices) - 1)
+        # 使用锁保护随机数生成器，避免DataParallel多线程访问时的竞争条件
+        # 注意：多进程模式下不使用锁（每个进程有独立的dataset实例）
+        if self._use_lock and self._lock is not None:
+            with self._lock:
+                random_idx = self.py_rng.randint(0, len(self.indices) - 1)
+        else:
+            random_idx = self.py_rng.randint(0, len(self.indices) - 1)
         symbol, start_idx = self.indices[random_idx]
 
         # Extract the sliding window from the dataframe.

@@ -18,19 +18,16 @@ import random
 import signal
 import psutil
 import atexit
-import fcntl
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
 import traceback
 from time import strftime
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # 确保项目根目录在路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,12 +36,9 @@ from optimized_config import OptimizedConfig, create_config_from_args, parse_arg
 from model.kronos import KronosTokenizer, Kronos, auto_regressive_inference
 from utils.training_pipeline_utils import (
     setup_logging,
-    setup_ddp,
-    cleanup_ddp,
     set_seed,
     get_model_size,
     format_time,
-    create_dataloaders_ddp,
     create_dataloaders_cpu,
     setup_comet_logger,
     save_model_checkpoint,
@@ -71,15 +65,13 @@ from utils.gpu_utils import (
 # 全局日志记录器
 logger = logging.getLogger('KronosPipeline')
 
-# 全局进程锁文件
-LOCK_FILE = 'training.lock'
-lock_fd = None
-_cleanup_done = False  # 防止重复清理的标志
+# 全局变量：标记是否已清理子进程
+_cleanup_done = False
 
 
 def safe_loss_item(loss):
     """
-    安全地获取loss的标量值，兼容DDP、DataParallel和单GPU模式
+    安全地获取loss的标量值
     
     Args:
         loss: torch.Tensor - loss张量
@@ -89,7 +81,7 @@ def safe_loss_item(loss):
     """
     if loss.dim() == 0:  # 标量tensor
         return loss.item()
-    else:  # DataParallel返回的多元素tensor
+    else:  # 多元素tensor
         return loss.mean().item()
 
 
@@ -156,46 +148,7 @@ def check_and_kill_existing_processes():
     return killed_count
 
 
-def acquire_lock():
-    """获取进程锁，确保只有一个训练实例运行"""
-    global lock_fd
-    
-    try:
-        # 创建锁文件
-        lock_fd = open(LOCK_FILE, 'w')
-        
-        # 尝试获取独占锁（非阻塞）
-        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        
-        # 写入当前进程PID
-        lock_fd.write(str(os.getpid()))
-        lock_fd.flush()
-        
-        logger.info(f"成功获取训练锁 (PID: {os.getpid()})")
-        return True
-    except IOError:
-        logger.error("无法获取训练锁：另一个训练实例正在运行")
-        logger.error(f"如果确认没有其他训练进程，请手动删除锁文件: {LOCK_FILE}")
-        return False
-    except Exception as e:
-        logger.error(f"获取训练锁时出错: {e}")
-        return False
-
-
-def release_lock():
-    """释放进程锁（幂等操作）"""
-    global lock_fd
-    
-    if lock_fd:
-        try:
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-            lock_fd.close()
-            lock_fd = None  # 标记为已释放
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
-            logger.info("已释放训练锁")
-        except Exception as e:
-            logger.warning(f"释放训练锁时出错: {e}")
+# 已移除锁相关函数
 
 
 def cleanup_child_processes():
@@ -264,87 +217,36 @@ class KronosTrainingPipeline:
         self.config = config
         self.data_source = data_source
         self.early_stopping_patience = early_stopping_patience
-        self.rank = 0
-        self.world_size = 1
-        self.local_rank = 0
         
-        # GPU fallback逻辑：优先使用GPU，如果不可用自动切换到CPU
-        # 设置设备（使用智能GPU选择）
-        self.available_gpus = []  # 可用GPU列表
-        self.use_data_parallel = False  # 是否使用DataParallel（DDP不可用时的备选）
-        
-        if use_gpu:
-            # 检测GPU可用性
-            if torch.cuda.is_available():
-                try:
-                    # 使用智能GPU选择
-                    min_free_memory_gb = getattr(config, 'min_gpu_memory_gb', 5.0)
-                    use_all_gpus = getattr(config, 'use_all_available_gpus', True)
-                    
-                    logger.info("开始检测可用GPU...")
-                    self.device, can_use_multi_gpu, self.available_gpus = setup_gpu_for_training(
-                        min_free_memory_gb=min_free_memory_gb,
-                        use_all_available=use_all_gpus
-                    )
-                    
-                    if self.device.type == "cuda":
-                        # 测试选定的GPU是否真的可用
-                        test_tensor = torch.zeros(1).to(self.device)
-                        del test_tensor
-                        clear_gpu_cache()
-                        
-                        self.gpu_type = "cuda"
-                        self.use_gpu = True
-                        
-                        # 记录可用GPU信息，但不在这里决定使用DataParallel
-                        # DDP的决策在setup_distributed()中进行
-                        if can_use_multi_gpu and len(self.available_gpus) > 1:
-                            logger.info(f"检测到 {len(self.available_gpus)} 个可用GPU: {self.available_gpus}")
-                            logger.info("将尝试使用DDP（DistributedDataParallel）进行多GPU训练")
-                        else:
-                            logger.info(f"使用单GPU训练: {self.device}")
-                        
-                        # 打印GPU内存信息
-                        print_gpu_memory_summary()
-                    else:
-                        # 没有符合要求的GPU，回退到CPU
-                        logger.warning("没有符合要求的GPU，自动切换到CPU训练")
-                        self.gpu_type = "cpu"
-                        self.use_gpu = False
-                        
-                except Exception as e:
-                    logger.warning(f"GPU设置失败: {str(e)}，自动切换到CPU训练")
-                    logger.warning(f"错误详情: {traceback.format_exc()}")
-                    self.device = torch.device("cpu")
-                    self.gpu_type = "cpu"
-                    self.use_gpu = False
-                    self.available_gpus = []
-                    self.use_data_parallel = False
-                    
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                try:
-                    # 尝试分配一个小tensor来验证MPS是否真的可用
-                    test_tensor = torch.zeros(1).to("mps")
-                    del test_tensor
-                    self.device = torch.device("mps")
-                    self.gpu_type = "mps"
-                    self.use_gpu = True
-                    logger.info("检测到可用的MPS设备，使用MPS训练")
-                except Exception as e:
-                    logger.warning(f"MPS设备检测失败: {str(e)}，自动切换到CPU训练")
-                    self.device = torch.device("cpu")
-                    self.gpu_type = "cpu"
-                    self.use_gpu = False
-            else:
-                logger.info("未检测到GPU设备，使用CPU训练")
+        # 简化设备选择：默认使用GPU，不可用时使用CPU
+        if use_gpu and torch.cuda.is_available():
+            try:
+                # 使用第一个可用GPU
+                self.device = torch.device("cuda:0")
+                # 测试GPU是否可用
+                test_tensor = torch.zeros(1).to(self.device)
+                del test_tensor
+                clear_gpu_cache()
+                
+                self.gpu_type = "cuda"
+                self.use_gpu = True
+                logger.info(f"使用单GPU训练: {self.device}")
+                logger.info(f"✓ 确认：使用单GPU训练模式，未使用DataParallel或DDP，不会出现多GPU锁死问题")
+                print_gpu_memory_summary()
+            except Exception as e:
+                logger.warning(f"GPU设置失败: {str(e)}，自动切换到CPU训练")
                 self.device = torch.device("cpu")
                 self.gpu_type = "cpu"
                 self.use_gpu = False
         else:
-            # 强制使用CPU
+            # 使用CPU训练
             self.device = torch.device("cpu")
             self.gpu_type = "cpu"
             self.use_gpu = False
+            if use_gpu:
+                logger.info("未检测到GPU设备，使用CPU训练")
+            else:
+                logger.info("使用CPU训练")
             
         # CPU多核优化：设置PyTorch线程数
         if self.gpu_type == "cpu" and hasattr(config, 'torch_threads') and config.torch_threads > 0:
@@ -352,31 +254,7 @@ class KronosTrainingPipeline:
             torch.set_num_interop_threads(config.torch_threads)
             logger.info(f"设置PyTorch线程数: {config.torch_threads}")
         
-        self.is_master = True  # 单进程或主进程
-        
-        # 设置分布式训练标志 - 优先使用DDP以获得最佳性能
-        # DDP需要torchrun启动，如果环境变量不存在则回退到DataParallel
-        if use_gpu and self.gpu_type == "cuda" and len(self.available_gpus) > 1:
-            # 检查是否有DDP环境变量（由torchrun设置）
-            has_ddp_env = all(key in os.environ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
-            if has_ddp_env:
-                # 使用DDP（最快）
-                self.use_ddp = True
-                self.use_data_parallel = False
-                logger.info("检测到torchrun环境，将使用DDP（DistributedDataParallel）进行多GPU训练")
-            else:
-                # 回退到DataParallel（兼容性）
-                self.use_ddp = False
-                self.use_data_parallel = True
-                logger.warning("未检测到torchrun环境变量，回退到DataParallel模式")
-                logger.warning("提示：使用 torchrun 启动可获得更好的性能")
-        else:
-            # 单GPU或CPU
-            self.use_ddp = False
-            self.use_data_parallel = False
-        
-        # 日志已在main函数中初始化，这里只记录信息
-        logger.info(f"初始化Kronos训练流水线 - GPU: {use_gpu}, GPU类型: {self.gpu_type}, 数据源: {data_source}, DDP: {self.use_ddp}, DataParallel: {self.use_data_parallel}")
+        logger.info(f"初始化Kronos训练流水线 - 设备: {self.device}, 数据源: {data_source}")
         
         # 设置保存路径，使用config中定义的路径
         self.tokenizer_save_dir = os.path.join(config.save_path, config.tokenizer_save_folder_name)
@@ -465,111 +343,86 @@ class KronosTrainingPipeline:
             logger.error(f"从配置文件创建 {model_type} 模型失败: {str(e)}")
             return None
         
-    def setup_distributed(self):
-        """设置分布式训练环境"""
-        if not self.use_gpu or self.gpu_type == "mps":
-            if self.gpu_type == "mps":
-                logger.info("使用MPS训练，跳过分布式设置（MPS不支持分布式训练）")
-            else:
-                logger.info("使用CPU训练，跳过分布式设置")
-            return
-        
-        # 检查是否有分布式环境变量，如果没有则禁用DDP
-        if not all(key in os.environ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK']):
-            logger.warning("未检测到分布式训练环境变量（RANK, WORLD_SIZE, LOCAL_RANK），禁用分布式训练，使用单GPU训练")
-            self.use_ddp = False
-            self.rank = 0
-            self.world_size = 1
-            self.local_rank = 0
-            self.device = torch.device("cuda:0")
-            self.is_master = True
-            set_seed(self.config.seed, 0)
-            return
-            
-        try:
-            self.rank, self.world_size, self.local_rank = setup_ddp()
-            self.device = torch.device(f"cuda:{self.local_rank}")
-            self.is_master = (self.rank == 0)
-            set_seed(self.config.seed, self.rank)
-            logger.info(f"分布式训练环境设置完成 - Rank: {self.rank}, World Size: {self.world_size}")
-        except Exception as e:
-            logger.warning(f"设置分布式训练环境时出错: {str(e)}")
-            logger.warning("回退到单GPU训练模式")
-            self.use_ddp = False
-            self.rank = 0
-            self.world_size = 1
-            self.local_rank = 0
-            self.device = torch.device("cuda:0")
-            self.is_master = True
-            set_seed(self.config.seed, 0)
+    # 已移除分布式训练相关方法
     
     def process_data(self):
         """处理数据"""
         success = True
         
-        if self.is_master:
-            try:
-                # 检查数据是否已存在
-                train_path = os.path.join(self.config.dataset_path, self.data_source, "train_data.pkl")
-                val_path = os.path.join(self.config.dataset_path, self.data_source, "val_data.pkl")
-                test_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
-                
-                # 判断是否需要下载数据
-                data_exists = all(os.path.exists(p) for p in [train_path, val_path, test_path])
-                should_download = self.config.force_download_data or not data_exists
-                
-                if data_exists and not self.config.force_download_data:
-                    logger.info(f"检测到已存在的{self.data_source}数据文件，跳过下载和处理")
-                    logger.info(f"数据存储路径:")
-                    logger.info(f"  - 训练数据: {train_path}")
-                    logger.info(f"  - 验证数据: {val_path}")
-                    logger.info(f"  - 测试数据: {test_path}")
-                    logger.info(f"如需重新下载数据，请使用 --force_download_data 参数或删除上述文件")
-                else:
-                    if self.config.force_download_data:
-                        logger.info(f"强制重新下载数据 (force_download_data=True)")
-                    logger.info(f"开始处理{self.data_source}数据...")
-                    # 使用工厂创建数据处理器
-                    processor = DataProcessorFactory.create_processor(self.data_source, self.config)
-                    result = processor.run_pipeline()
-                    logger.info(f"数据处理完成: {result}")
-                
-                # 加载测试数据，用于每个训练阶段的评估
-                self.load_test_data()
-            except Exception as e:
-                logger.error(f"处理数据时出错: {str(e)}")
-                success = False
-        
-        # 同步所有进程，确保主进程完成数据处理后其他进程才继续
-        if self.use_ddp:
-            dist.barrier()
-            # 广播主进程的处理结果到所有进程
-            success_tensor = torch.tensor([1.0 if success else 0.0], device=self.device)
-            dist.broadcast(success_tensor, src=0)
-            success = bool(success_tensor.item() > 0.5)
+        try:
+            # 检查数据是否已存在
+            train_path = os.path.join(self.config.dataset_path, self.data_source, "train_data.pkl")
+            val_path = os.path.join(self.config.dataset_path, self.data_source, "val_data.pkl")
+            test_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
+            
+            # 判断是否需要下载数据
+            data_exists = all(os.path.exists(p) for p in [train_path, val_path, test_path])
+            
+            # 如果数据文件存在，检查股票数量是否匹配配置
+            if data_exists and not self.config.force_download_data:
+                try:
+                    import pickle
+                    with open(train_path, 'rb') as f:
+                        train_data = pickle.load(f)
+                    actual_stock_count = len(train_data) if isinstance(train_data, dict) else 0
+                    expected_stock_count = getattr(self.config, 'top_k_stocks', 0)
+                    
+                    # 如果实际股票数量少于配置的top_k_stocks，强制重新处理
+                    if expected_stock_count > 0 and actual_stock_count < expected_stock_count:
+                        logger.warning(f"检测到数据文件中的股票数量({actual_stock_count})少于配置的top_k_stocks({expected_stock_count})")
+                        logger.warning(f"将强制重新处理数据以匹配配置")
+                        self.config.force_download_data = True
+                        data_exists = False
+                    else:
+                        logger.info(f"检测到已存在的{self.data_source}数据文件，包含 {actual_stock_count} 支股票，跳过下载和处理")
+                        logger.info(f"数据存储路径:")
+                        logger.info(f"  - 训练数据: {train_path}")
+                        logger.info(f"  - 验证数据: {val_path}")
+                        logger.info(f"  - 测试数据: {test_path}")
+                        logger.info(f"如需重新下载数据，请使用 --force_download_data 参数或删除上述文件")
+                except Exception as e:
+                    logger.warning(f"检查数据文件时出错: {e}，将重新处理数据")
+                    self.config.force_download_data = True
+                    data_exists = False
+            
+            should_download = self.config.force_download_data or not data_exists
+            
+            if should_download:
+                if self.config.force_download_data:
+                    logger.info(f"强制重新下载数据 (force_download_data=True)")
+                logger.info(f"开始处理{self.data_source}数据...")
+                # 使用工厂创建数据处理器
+                processor = DataProcessorFactory.create_processor(self.data_source, self.config)
+                result = processor.run_pipeline()
+                logger.info(f"数据处理完成: {result}")
+            
+            # 加载测试数据，用于每个训练阶段的评估
+            self.load_test_data()
+        except Exception as e:
+            logger.error(f"处理数据时出错: {str(e)}")
+            success = False
         
         return success
         
     def load_test_data(self):
         """加载测试数据，用于模型评估"""
-        if self.is_master:
-            try:
-                test_data_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
-                logger.info(f"加载测试数据: {test_data_path}")
-                if os.path.exists(test_data_path):
-                    with open(test_data_path, 'rb') as f:
-                        self.test_data = pickle.load(f)
-                    logger.info(f"测试数据加载成功，包含 {len(self.test_data)} 支股票")
-                else:
-                    logger.warning(f"测试数据文件不存在: {test_data_path}")
-                    self.test_data = None
-            except Exception as e:
-                logger.error(f"加载测试数据时出错: {str(e)}")
+        try:
+            test_data_path = os.path.join(self.config.dataset_path, self.data_source, "test_data.pkl")
+            logger.info(f"加载测试数据: {test_data_path}")
+            if os.path.exists(test_data_path):
+                with open(test_data_path, 'rb') as f:
+                    self.test_data = pickle.load(f)
+                logger.info(f"测试数据加载成功，包含 {len(self.test_data)} 支股票")
+            else:
+                logger.warning(f"测试数据文件不存在: {test_data_path}")
                 self.test_data = None
+        except Exception as e:
+            logger.error(f"加载测试数据时出错: {str(e)}")
+            self.test_data = None
     
     def _check_early_stopping_sync(self, early_stopping_counter, patience):
         """
-        检查并同步提前终止决策（支持分布式训练）
+        检查提前终止决策
         
         Args:
             early_stopping_counter: 当前的提前终止计数器
@@ -578,18 +431,7 @@ class KronosTrainingPipeline:
         Returns:
             bool: 是否应该停止训练
         """
-        should_stop = False
-        
-        if self.is_master:
-            should_stop = (early_stopping_counter >= patience)
-        
-        # 在分布式环境中同步提前终止决策
-        if self.use_ddp:
-            stop_tensor = torch.tensor([1.0 if should_stop else 0.0], device=self.device)
-            dist.broadcast(stop_tensor, src=0)
-            should_stop = bool(stop_tensor.item() > 0.5)
-        
-        return should_stop
+        return early_stopping_counter >= patience
     
     def train_tokenizer(self):
         """训练分词模型"""
@@ -632,24 +474,10 @@ class KronosTrainingPipeline:
             logger.error(f"初始化分词模型时出错: {str(e)}")
             return False
         
-        # 设置DDP或DataParallel
-        if self.use_ddp:
-            model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
-        elif self.use_data_parallel:
-            # 使用DataParallel进行多GPU训练（不需要环境变量）
-            logger.info(f"将分词模型包装为DataParallel，使用GPU: {self.available_gpus}")
-            model = torch.nn.DataParallel(model, device_ids=self.available_gpus)
-            logger.info("DataParallel包装完成")
-        
         # 创建数据加载器
-        if self.use_ddp:
-            train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_ddp(
-                self.config.__dict__, self.rank, self.world_size
-            )
-        else:
-            train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_cpu(
-                self.config.__dict__
-            )
+        train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_cpu(
+            self.config.__dict__
+        )
         
         # 设置优化器和调度器
         optimizer = torch.optim.AdamW(
@@ -668,13 +496,12 @@ class KronosTrainingPipeline:
         )
         
         # 设置Comet日志记录器
-        comet_logger = setup_comet_logger(self.config.__dict__) if self.is_master else None
+        comet_logger = setup_comet_logger(self.config.__dict__)
         
         # 计算智能日志间隔（确保每个epoch最多打印指定次数）
         max_logs_per_epoch = getattr(self.config, 'max_logs_per_epoch', 30)
         actual_log_interval = max(1, len(train_loader) // max_logs_per_epoch)
-        if self.is_master:
-            logger.info(f"训练配置: 总步数={len(train_loader)}, 日志间隔={actual_log_interval}, 预计每epoch打印{len(train_loader)//actual_log_interval}次日志")
+        logger.info(f"训练配置: 总步数={len(train_loader)}, 日志间隔={actual_log_interval}, 预计每epoch打印{len(train_loader)//actual_log_interval}次日志")
         
         # 训练循环
         best_val_loss = float('inf')
@@ -684,69 +511,77 @@ class KronosTrainingPipeline:
         last_test_loss = float('inf')  # 上次测试损失
         
         for epoch_idx in range(self.config.epochs):
-            logger.info(f"[Rank {self.rank}] 开始 Tokenizer Epoch {epoch_idx + 1}/{self.config.epochs}")
+            logger.info(f"开始 Tokenizer Epoch {epoch_idx + 1}/{self.config.epochs}")
             epoch_start_time = time.time()
             model.train()
             
             # 设置数据集种子
-            if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
-                logger.info(f"[Rank {self.rank}] 设置sampler epoch: {epoch_idx}")
-                train_loader.sampler.set_epoch(epoch_idx)
-            train_dataset.set_epoch_seed(epoch_idx * 10000 + (self.rank if self.use_gpu else 0))
+            train_dataset.set_epoch_seed(epoch_idx * 10000)
             valid_dataset.set_epoch_seed(0)  # 保持验证采样一致
-            logger.info(f"[Rank {self.rank}] 数据集种子设置完成，准备开始训练循环")
+            logger.info(f"数据集种子设置完成，准备开始训练循环")
             
             # 训练循环
-            for i, (ori_batch_x, _) in enumerate(train_loader):
-                ori_batch_x = ori_batch_x.squeeze(0).to(self.device)
+            try:
+                logger.info(f"开始迭代训练数据加载器，总步数: {len(train_loader)}")
+                logger.info(f"准备获取第一个batch...")
+                train_iter = iter(train_loader)
+                logger.info(f"数据加载器迭代器创建成功，开始获取第一个batch...")
                 
-                # 梯度累积循环
-                current_batch_total_loss = 0.0
-                for j in range(self.config.accumulation_steps):
-                    start_idx = j * (ori_batch_x.shape[0] // self.config.accumulation_steps)
-                    end_idx = (j + 1) * (ori_batch_x.shape[0] // self.config.accumulation_steps)
-                    batch_x = ori_batch_x[start_idx:end_idx]
+                for i, (ori_batch_x, _) in enumerate(train_iter):
+                    if i == 0:
+                        logger.info(f"成功获取第一个batch，shape: {ori_batch_x.shape}")
                     
-                    # 前向传播
-                    zs, bsq_loss, _, _ = model(batch_x)
-                    z_pre, z = zs
+                    ori_batch_x = ori_batch_x.squeeze(0).to(self.device)
                     
-                    # 损失计算
-                    recon_loss_pre = F.mse_loss(z_pre, batch_x)
-                    recon_loss_all = F.mse_loss(z, batch_x)
-                    recon_loss = recon_loss_pre + recon_loss_all
-                    loss = (recon_loss + bsq_loss) / 2
+                    # 梯度累积循环
+                    current_batch_total_loss = 0.0
+                    for j in range(self.config.accumulation_steps):
+                        start_idx = j * (ori_batch_x.shape[0] // self.config.accumulation_steps)
+                        end_idx = (j + 1) * (ori_batch_x.shape[0] // self.config.accumulation_steps)
+                        batch_x = ori_batch_x[start_idx:end_idx]
+                        
+                        # 前向传播
+                        zs, bsq_loss, _, _ = model(batch_x)
+                        z_pre, z = zs
+                        
+                        # 损失计算
+                        recon_loss_pre = F.mse_loss(z_pre, batch_x)
+                        recon_loss_all = F.mse_loss(z, batch_x)
+                        recon_loss = recon_loss_pre + recon_loss_all
+                        loss = (recon_loss + bsq_loss) / 2
+                        
+                        loss_scaled = loss / self.config.accumulation_steps
+                        current_batch_total_loss += safe_loss_item(loss)
+                        loss_scaled.backward()
                     
-                    # DataParallel返回的loss可能是多元素tensor，需要先求平均
-                    if self.use_data_parallel and loss.dim() > 0:
-                        loss = loss.mean()
-                    
-                    loss_scaled = loss / self.config.accumulation_steps
-                    current_batch_total_loss += safe_loss_item(loss)
-                    loss_scaled.backward()
-                
-                # 优化器步骤
-                torch.nn.utils.clip_grad_norm_(
-                    model.module.parameters() if (self.use_ddp or self.use_data_parallel) else model.parameters(), 
-                    max_norm=2.0
-                )
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                
-                # 日志记录
-                if self.is_master and (batch_idx_global_train + 1) % actual_log_interval == 0:
-                    avg_loss = current_batch_total_loss / self.config.accumulation_steps
-                    logger.info(
-                        f"[Epoch {epoch_idx + 1}/{self.config.epochs}, Step {i + 1}/{len(train_loader)}] "
-                        f"LR {optimizer.param_groups[0]['lr']:.6f}, Loss: {avg_loss:.4f}"
+                    # 优化器步骤
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), 
+                        max_norm=2.0
                     )
-                if self.is_master and comet_logger:
-                    avg_loss = current_batch_total_loss / self.config.accumulation_steps
-                    comet_logger.log_metric('train_tokenizer_loss_batch', avg_loss, step=batch_idx_global_train)
-                    comet_logger.log_metric('tokenizer_learning_rate', optimizer.param_groups[0]["lr"], step=batch_idx_global_train)
-                
-                batch_idx_global_train += 1
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    
+                    # 日志记录
+                    if (batch_idx_global_train + 1) % actual_log_interval == 0:
+                        avg_loss = current_batch_total_loss / self.config.accumulation_steps
+                        logger.info(
+                            f"[Epoch {epoch_idx + 1}/{self.config.epochs}, Step {i + 1}/{len(train_loader)}] "
+                            f"LR {optimizer.param_groups[0]['lr']:.6f}, Loss: {avg_loss:.4f}"
+                        )
+                    if comet_logger:
+                        avg_loss = current_batch_total_loss / self.config.accumulation_steps
+                        comet_logger.log_metric('train_tokenizer_loss_batch', avg_loss, step=batch_idx_global_train)
+                        comet_logger.log_metric('tokenizer_learning_rate', optimizer.param_groups[0]["lr"], step=batch_idx_global_train)
+                    
+                    batch_idx_global_train += 1
+            except Exception as e:
+                logger.error(f"训练循环中发生错误: {str(e)}")
+                logger.error(f"错误发生在第 {i+1 if 'i' in locals() else '未知'} 步（共 {len(train_loader)} 步）")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
             
             # 验证循环
             model.eval()
@@ -763,27 +598,16 @@ class KronosTrainingPipeline:
                     tot_val_loss += val_loss_item.item() * ori_batch_x.size(0)
                     val_sample_count += ori_batch_x.size(0)
             
-            # 如果是分布式训练，收集所有进程的验证损失
-            if self.use_ddp:
-                val_loss_sum_tensor = torch.tensor(tot_val_loss, device=self.device)
-                val_count_tensor = torch.tensor(val_sample_count, device=self.device)
-                dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
-                dist.all_reduce(val_count_tensor, op=dist.ReduceOp.SUM)
-                
-                tot_val_loss = val_loss_sum_tensor.item()
-                val_sample_count = val_count_tensor.item()
-            
             avg_val_loss = tot_val_loss / val_sample_count if val_sample_count > 0 else 0
             
-            # 主进程进行摘要和检查点保存
-            if self.is_master:
-                logger.info(f"\n--- Epoch {epoch_idx + 1}/{self.config.epochs} Summary ---")
-                logger.info(f"验证损失: {avg_val_loss:.4f}")
-                logger.info(f"本轮用时: {format_time(time.time() - epoch_start_time)}")
-                logger.info(f"总用时: {format_time(time.time() - start_time)}\n")
-                
-                if comet_logger:
-                    comet_logger.log_metric('val_tokenizer_loss_epoch', avg_val_loss, epoch=epoch_idx)
+            # 摘要和检查点保存
+            logger.info(f"\n--- Epoch {epoch_idx + 1}/{self.config.epochs} Summary ---")
+            logger.info(f"验证损失: {avg_val_loss:.4f}")
+            logger.info(f"本轮用时: {format_time(time.time() - epoch_start_time)}")
+            logger.info(f"总用时: {format_time(time.time() - start_time)}\n")
+            
+            if comet_logger:
+                comet_logger.log_metric('val_tokenizer_loss_epoch', avg_val_loss, epoch=epoch_idx)
                 
                 # 在测试集上评估当前模型
                 if hasattr(self, 'test_data') and self.test_data is not None:
@@ -792,10 +616,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_ddp or self.use_data_parallel:
-                        model.module.save_pretrained(temp_save_path)
-                    else:
-                        model.save_pretrained(temp_save_path)
+                    model.save_pretrained(temp_save_path)
                     
                     # 使用工具函数评估模型，使用config中定义的路径
                     self.best_tokenizer_test_loss, eval_info = evaluate_models_during_training(
@@ -823,21 +644,10 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_tokenizer_path
-                    if self.use_ddp or self.use_data_parallel:
-                        model.module.save_pretrained(save_path)
-                    else:
-                        model.save_pretrained(save_path)
+                    model.save_pretrained(save_path)
                     logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
                     if comet_logger:
                         comet_logger.log_model("best_model", save_path)
-            
-            # 在分布式训练中，同步test_loss到所有进程
-            if self.use_ddp and hasattr(self, 'test_data') and self.test_data is not None:
-                logger.info(f"[Rank {self.rank}] 同步test_loss: {self.best_tokenizer_test_loss}")
-                test_loss_tensor = torch.tensor([self.best_tokenizer_test_loss], device=self.device)
-                dist.broadcast(test_loss_tensor, src=0)
-                self.best_tokenizer_test_loss = test_loss_tensor.item()
-                logger.info(f"[Rank {self.rank}] 同步后test_loss: {self.best_tokenizer_test_loss}")
             
             # 基于测试集的提前终止逻辑
             if hasattr(self, 'test_data') and self.test_data is not None:
@@ -845,28 +655,19 @@ class KronosTrainingPipeline:
                 if self.best_tokenizer_test_loss < float('inf'):
                     if self.best_tokenizer_test_loss >= last_test_loss:
                         early_stopping_counter += 1
-                        if self.is_master:
-                            logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
+                        logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
                     else:
                         early_stopping_counter = 0  # 重置计数器
-                        if self.is_master:
-                            logger.info(f"测试损失改善，重置提前终止计数器")
+                        logger.info(f"测试损失改善，重置提前终止计数器")
                     
                     last_test_loss = self.best_tokenizer_test_loss
                     
-                    # 检查是否需要提前终止（支持分布式同步）
+                    # 检查是否需要提前终止
                     if self._check_early_stopping_sync(early_stopping_counter, self.early_stopping_patience):
                         logger.info(f"提前终止训练：连续 {self.early_stopping_patience} 个epoch测试损失未改善")
                         break
-            
-            # 同步所有进程
-            if self.use_ddp:
-                logger.info(f"[Rank {self.rank}] Tokenizer训练epoch结束，到达同步点")
-                dist.barrier()
-                logger.info(f"[Rank {self.rank}] Tokenizer训练epoch同步完成")
         
         # 保存训练摘要
-        if self.is_master:
             # 从评估历史中找出损失最小的模型
             best_eval = None
             if evaluation_history:
@@ -880,7 +681,6 @@ class KronosTrainingPipeline:
                 'best_val_loss': best_val_loss,
                 'best_test_loss': self.best_tokenizer_test_loss if hasattr(self, 'best_tokenizer_test_loss') else None,
                 'epochs': self.config.epochs,
-                'world_size': self.world_size,
                 'device': str(self.device),
                 'evaluation_history': evaluation_history,  # 添加评估历史
                 'final_best_model': {
@@ -955,24 +755,10 @@ class KronosTrainingPipeline:
             logger.error(f"初始化模型时出错: {str(e)}")
             return False
         
-        # 设置DDP或DataParallel
-        if self.use_ddp:
-            model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
-        elif self.use_data_parallel:
-            # 使用DataParallel进行多GPU训练（不需要环境变量）
-            logger.info(f"将预测模型包装为DataParallel，使用GPU: {self.available_gpus}")
-            model = torch.nn.DataParallel(model, device_ids=self.available_gpus)
-            logger.info("DataParallel包装完成")
-        
         # 创建数据加载器
-        if self.use_ddp:
-            train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_ddp(
-                self.config.__dict__, self.rank, self.world_size
-            )
-        else:
-            train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_cpu(
-                self.config.__dict__
-            )
+        train_loader, val_loader, train_dataset, valid_dataset = create_dataloaders_cpu(
+            self.config.__dict__
+        )
         
         # 设置优化器和调度器
         optimizer = torch.optim.AdamW(
@@ -992,13 +778,12 @@ class KronosTrainingPipeline:
         )
         
         # 设置Comet日志记录器
-        comet_logger = setup_comet_logger(self.config.__dict__) if self.is_master else None
+        comet_logger = setup_comet_logger(self.config.__dict__)
         
         # 计算智能日志间隔（确保每个epoch最多打印指定次数）
         max_logs_per_epoch = getattr(self.config, 'max_logs_per_epoch', 30)
         actual_log_interval = max(1, len(train_loader) // max_logs_per_epoch)
-        if self.is_master:
-            logger.info(f"训练配置: 总步数={len(train_loader)}, 日志间隔={actual_log_interval}, 预计每epoch打印{len(train_loader)//actual_log_interval}次日志")
+        logger.info(f"训练配置: 总步数={len(train_loader)}, 日志间隔={actual_log_interval}, 预计每epoch打印{len(train_loader)//actual_log_interval}次日志")
         
         # 训练循环
         best_val_loss = float('inf')
@@ -1012,9 +797,7 @@ class KronosTrainingPipeline:
             model.train()
             
             # 设置数据集种子
-            if hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
-                train_loader.sampler.set_epoch(epoch_idx)
-            train_dataset.set_epoch_seed(epoch_idx * 10000 + (self.rank if self.use_gpu else 0))
+            train_dataset.set_epoch_seed(epoch_idx * 10000)
             valid_dataset.set_epoch_seed(0)
             
             # 训练循环
@@ -1032,35 +815,27 @@ class KronosTrainingPipeline:
                 
                 # 前向传播和损失计算
                 logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                if self.use_ddp or self.use_data_parallel:
-                    loss, s1_loss, s2_loss = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
-                else:
-                    loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                loss, s1_loss, s2_loss = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                 
-                # DataParallel返回的loss可能是多元素tensor，需要先求平均
-                if self.use_data_parallel and loss.dim() > 0:
-                    loss = loss.mean()
-                    s1_loss = s1_loss.mean() if s1_loss.dim() > 0 else s1_loss
-                    s2_loss = s2_loss.mean() if s2_loss.dim() > 0 else s2_loss
                 
                 # 反向传播和优化
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    model.module.parameters() if (self.use_ddp or self.use_data_parallel) else model.parameters(), 
+                    model.parameters(), 
                     max_norm=3.0
                 )
                 optimizer.step()
                 scheduler.step()
                 
                 # 日志记录
-                if self.is_master and (batch_idx_global + 1) % actual_log_interval == 0:
+                if (batch_idx_global + 1) % actual_log_interval == 0:
                     lr = optimizer.param_groups[0]['lr']
                     logger.info(
                         f"[Epoch {epoch_idx + 1}/{self.config.epochs}, Step {i + 1}/{len(train_loader)}] "
                         f"LR {lr:.6f}, Loss: {safe_loss_item(loss):.4f}"
                     )
-                if self.is_master and comet_logger:
+                if comet_logger:
                     lr = optimizer.param_groups[0]['lr']
                     comet_logger.log_metric('train_predictor_loss_batch', safe_loss_item(loss), step=batch_idx_global)
                     comet_logger.log_metric('train_S1_loss_each_batch', safe_loss_item(s1_loss), step=batch_idx_global)
@@ -1084,35 +859,21 @@ class KronosTrainingPipeline:
                     token_out = [token_seq_0[:, 1:], token_seq_1[:, 1:]]
                     
                     logits = model(token_in[0], token_in[1], batch_x_stamp[:, :-1, :])
-                    if self.use_ddp or self.use_data_parallel:
-                        val_loss, _, _ = model.module.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
-                    else:
-                        val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
+                    val_loss, _, _ = model.head.compute_loss(logits[0], logits[1], token_out[0], token_out[1])
                     
                     tot_val_loss += safe_loss_item(val_loss)
                     val_batches_processed += 1
             
-            # 如果是分布式训练，收集所有进程的验证损失
-            if self.use_ddp:
-                val_loss_sum_tensor = torch.tensor(tot_val_loss, device=self.device)
-                val_batches_tensor = torch.tensor(val_batches_processed, device=self.device)
-                dist.all_reduce(val_loss_sum_tensor, op=dist.ReduceOp.SUM)
-                dist.all_reduce(val_batches_tensor, op=dist.ReduceOp.SUM)
-                
-                tot_val_loss = val_loss_sum_tensor.item()
-                val_batches_processed = val_batches_tensor.item()
-            
             avg_val_loss = tot_val_loss / val_batches_processed if val_batches_processed > 0 else 0
             
-            # 主进程进行摘要和检查点保存
-            if self.is_master:
-                logger.info(f"\n--- Epoch {epoch_idx + 1}/{self.config.epochs} Summary ---")
-                logger.info(f"验证损失: {avg_val_loss:.4f}")
-                logger.info(f"本轮用时: {format_time(time.time() - epoch_start_time)}")
-                logger.info(f"总用时: {format_time(time.time() - start_time)}\n")
-                
-                if comet_logger:
-                    comet_logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
+            # 摘要和检查点保存
+            logger.info(f"\n--- Epoch {epoch_idx + 1}/{self.config.epochs} Summary ---")
+            logger.info(f"验证损失: {avg_val_loss:.4f}")
+            logger.info(f"本轮用时: {format_time(time.time() - epoch_start_time)}")
+            logger.info(f"总用时: {format_time(time.time() - start_time)}\n")
+            
+            if comet_logger:
+                comet_logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
                 
                 # 在测试集上评估当前模型
                 if hasattr(self, 'test_data') and self.test_data is not None:
@@ -1121,10 +882,7 @@ class KronosTrainingPipeline:
                     os.makedirs(temp_save_path, exist_ok=True)
                     
                     # 保存当前模型到临时路径用于评估
-                    if self.use_ddp or self.use_data_parallel:
-                        model.module.save_pretrained(temp_save_path)
-                    else:
-                        model.save_pretrained(temp_save_path)
+                    model.save_pretrained(temp_save_path)
                     
                     # 使用工具函数评估模型，使用config中定义的路径
                     self.best_predictor_test_loss, eval_info = evaluate_models_during_training(
@@ -1152,21 +910,10 @@ class KronosTrainingPipeline:
                 elif avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     save_path = self.config.finetuned_predictor_path
-                    if self.use_ddp or self.use_data_parallel:
-                        model.module.save_pretrained(save_path)
-                    else:
-                        model.save_pretrained(save_path)
+                    model.save_pretrained(save_path)
                     logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
                     if comet_logger:
                         comet_logger.log_model("best_model", save_path)
-            
-            # 在分布式训练中，同步test_loss到所有进程
-            if self.use_ddp and hasattr(self, 'test_data') and self.test_data is not None:
-                logger.info(f"[Rank {self.rank}] 同步predictor test_loss: {self.best_predictor_test_loss}")
-                test_loss_tensor = torch.tensor([self.best_predictor_test_loss], device=self.device)
-                dist.broadcast(test_loss_tensor, src=0)
-                self.best_predictor_test_loss = test_loss_tensor.item()
-                logger.info(f"[Rank {self.rank}] 同步后predictor test_loss: {self.best_predictor_test_loss}")
             
             # 基于测试集的提前终止逻辑
             if hasattr(self, 'test_data') and self.test_data is not None:
@@ -1174,28 +921,19 @@ class KronosTrainingPipeline:
                 if self.best_predictor_test_loss < float('inf'):
                     if self.best_predictor_test_loss >= last_test_loss:
                         early_stopping_counter += 1
-                        if self.is_master:
-                            logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
+                        logger.info(f"测试损失未改善，提前终止计数器: {early_stopping_counter}/{self.early_stopping_patience}")
                     else:
                         early_stopping_counter = 0  # 重置计数器
-                        if self.is_master:
-                            logger.info(f"测试损失改善，重置提前终止计数器")
+                        logger.info(f"测试损失改善，重置提前终止计数器")
                     
                     last_test_loss = self.best_predictor_test_loss
                     
-                    # 检查是否需要提前终止（支持分布式同步）
+                    # 检查是否需要提前终止
                     if self._check_early_stopping_sync(early_stopping_counter, self.early_stopping_patience):
                         logger.info(f"提前终止训练：连续 {self.early_stopping_patience} 个epoch测试损失未改善")
                         break
             
-            # 同步所有进程
-            if self.use_ddp:
-                logger.info(f"[Rank {self.rank}] Predictor训练epoch结束，到达同步点")
-                dist.barrier()
-                logger.info(f"[Rank {self.rank}] Predictor训练epoch同步完成")
-        
         # 保存训练摘要
-        if self.is_master:
             # 从评估历史中找出损失最小的模型
             best_eval = None
             if evaluation_history:
@@ -1209,7 +947,6 @@ class KronosTrainingPipeline:
                 'best_val_loss': best_val_loss,
                 'best_test_loss': self.best_predictor_test_loss if hasattr(self, 'best_predictor_test_loss') else None,
                 'epochs': self.config.epochs,
-                'world_size': self.world_size,
                 'device': str(self.device),
                 'evaluation_history': evaluation_history,  # 添加评估历史
                 'final_best_model': {
@@ -1235,8 +972,6 @@ class KronosTrainingPipeline:
     
     def evaluate_models(self):
         """验证最佳模型是否已经选择完成"""
-        if not self.is_master:
-            return True
             
         logger.info("验证最佳模型选择...")
         try:
@@ -1301,9 +1036,6 @@ class KronosTrainingPipeline:
         1. 预测未来10个工作日的股票走势（详细预测，保存到日期时间戳文件）
         2. 预测下一个工作日的涨跌幅（简化预测，增量更新到主Excel文件）
         """
-        if not self.is_master:
-            return True
-            
         logger.info("=" * 60)
         logger.info("开始预测股票走势...")
         logger.info("=" * 60)
@@ -1430,7 +1162,6 @@ class KronosTrainingPipeline:
         self.use_gpu = False
         self.gpu_type = "cpu"
         self.device = torch.device("cpu")
-        self.use_ddp = False
         
         # 设置CPU多核优化
         if hasattr(self.config, 'torch_threads') and self.config.torch_threads > 0:
@@ -1446,9 +1177,6 @@ class KronosTrainingPipeline:
         time_stats = {}  # 记录各阶段耗时
         
         try:
-            # 设置分布式环境（如果使用CUDA多GPU）
-            if self.use_ddp:
-                self.setup_distributed()
             
             # 处理数据并加载测试数据
             step_start = time.time()
@@ -1520,49 +1248,40 @@ class KronosTrainingPipeline:
             # 计算总耗时
             total_time = time.time() - pipeline_start_time
             
-            if self.is_master:
-                logger.info("完整训练流水线执行成功")
-                logger.info(f"最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
-                logger.info(f"最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
-                logger.info(f"最佳分词模型路径: {self.config.finetuned_tokenizer_path}")
-                logger.info(f"最佳预测模型路径: {self.config.finetuned_predictor_path}")
-                
-                # 更新历史最佳模型路径
-                # 使用正确的model_history_subdir路径，统一命名（去掉 local_ 和 remote_ 前缀）
-                model_version = getattr(self.config, 'model_version', 'default')
-                normalized_version = model_version.replace('local_', '').replace('remote_', '')
-                model_history_subdir = os.path.join(self.config.model_history_dir, f"{self.data_source}/{normalized_version}")
-                success, tokenizer_path, predictor_path = update_best_model_paths(self.config, model_history_subdir)
-                if success:
-                    logger.info("已更新历史最佳模型路径")
-                    if tokenizer_path:
-                        logger.info(f"历史最佳分词模型路径: {tokenizer_path}")
-                    if predictor_path:
-                        logger.info(f"历史最佳预测模型路径: {predictor_path}")
-                else:
-                    logger.warning("更新历史最佳模型路径失败")
-                
-                # 打印时间统计（放在最后）
-                logger.info("\n" + "=" * 60)
-                logger.info("各阶段耗时统计:")
-                for stage_name, duration in time_stats.items():
-                    logger.info(f"  {stage_name}: {format_duration(duration)}")
-                logger.info(f"  总耗时: {format_duration(total_time)}")
-                logger.info("=" * 60)
+            logger.info("完整训练流水线执行成功")
+            logger.info(f"最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
+            logger.info(f"最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
+            logger.info(f"最佳分词模型路径: {self.config.finetuned_tokenizer_path}")
+            logger.info(f"最佳预测模型路径: {self.config.finetuned_predictor_path}")
             
-            # 清理分布式环境
-            if self.use_ddp:
-                cleanup_ddp()
-                
+            # 更新历史最佳模型路径
+            # 使用正确的model_history_subdir路径，统一命名（去掉 local_ 和 remote_ 前缀）
+            model_version = getattr(self.config, 'model_version', 'default')
+            normalized_version = model_version.replace('local_', '').replace('remote_', '')
+            model_history_subdir = os.path.join(self.config.model_history_dir, f"{self.data_source}/{normalized_version}")
+            success, tokenizer_path, predictor_path = update_best_model_paths(self.config, model_history_subdir)
+            if success:
+                logger.info("已更新历史最佳模型路径")
+                if tokenizer_path:
+                    logger.info(f"历史最佳分词模型路径: {tokenizer_path}")
+                if predictor_path:
+                    logger.info(f"历史最佳预测模型路径: {predictor_path}")
+            else:
+                logger.warning("更新历史最佳模型路径失败")
+            
+            # 打印时间统计（放在最后）
+            logger.info("\n" + "=" * 60)
+            logger.info("各阶段耗时统计:")
+            for stage_name, duration in time_stats.items():
+                logger.info(f"  {stage_name}: {format_duration(duration)}")
+            logger.info(f"  总耗时: {format_duration(total_time)}")
+            logger.info("=" * 60)
+            
             return True
         except Exception as e:
             logger.error(f"执行训练流水线时出错: {str(e)}")
             # 已在文件顶部导入
             logger.error(traceback.format_exc())
-            
-            # 清理分布式环境
-            if self.use_ddp:
-                cleanup_ddp()
                 
             return False
 
@@ -1584,25 +1303,11 @@ def main():
     setup_signal_handlers()
     logger.info("已设置进程信号处理器")
     
-    # 检查是否在DDP环境中
-    is_ddp = all(key in os.environ for key in ['RANK', 'WORLD_SIZE', 'LOCAL_RANK'])
-    rank = int(os.environ.get('RANK', 0))
-    
-    # 只有主进程需要清理旧进程和获取锁（DDP模式下只有rank 0执行，避免锁冲突）
-    if not is_ddp or rank == 0:
-        # 检查并清理旧进程（可选，通过命令行参数控制）
-        if getattr(args, 'kill_existing', False):
-            killed = check_and_kill_existing_processes()
-            if killed > 0:
-                logger.info(f"已清理 {killed} 个旧训练进程")
-        
-        # 获取进程锁，防止重复启动
-        if not acquire_lock():
-            logger.error("无法启动训练：另一个训练实例正在运行")
-            return 1
-    else:
-        # DDP子进程（rank > 0）跳过锁获取
-        logger.info(f"DDP子进程 (rank={rank})，跳过进程锁检查")
+    # 检查并清理旧进程（可选，通过命令行参数控制）
+    if getattr(args, 'kill_existing', False):
+        killed = check_and_kill_existing_processes()
+        if killed > 0:
+            logger.info(f"已清理 {killed} 个旧训练进程")
     
     try:
         # 使用优化配置类创建配置
@@ -1624,12 +1329,7 @@ def main():
         
         return 0 if success else 1
     finally:
-        # 只有主进程才释放锁和清理子进程
-        if not is_ddp or rank == 0:
-            cleanup_child_processes()
-            release_lock()
-        else:
-            logger.info(f"DDP子进程 (rank={rank})，跳过锁释放和子进程清理")
+        cleanup_child_processes()
 
 
 if __name__ == '__main__':
