@@ -606,48 +606,49 @@ class KronosTrainingPipeline:
             logger.info(f"本轮用时: {format_time(time.time() - epoch_start_time)}")
             logger.info(f"总用时: {format_time(time.time() - start_time)}\n")
             
+            # 记录到Comet（如果启用）
             if comet_logger:
                 comet_logger.log_metric('val_tokenizer_loss_epoch', avg_val_loss, epoch=epoch_idx)
+            
+            # 在测试集上评估当前模型（无论是否启用comet_logger都要执行）
+            if hasattr(self, 'test_data') and self.test_data is not None:
+                # 创建临时路径用于当前模型评估，包含epoch信息
+                temp_save_path = f"{self.tokenizer_save_dir}/checkpoints/current_model_epoch_{epoch_idx + 1}"
+                os.makedirs(temp_save_path, exist_ok=True)
                 
-                # 在测试集上评估当前模型
-                if hasattr(self, 'test_data') and self.test_data is not None:
-                    # 创建临时路径用于当前模型评估，包含epoch信息
-                    temp_save_path = f"{self.tokenizer_save_dir}/checkpoints/current_model_epoch_{epoch_idx + 1}"
-                    os.makedirs(temp_save_path, exist_ok=True)
-                    
-                    # 保存当前模型到临时路径用于评估
-                    model.save_pretrained(temp_save_path)
-                    
-                    # 使用工具函数评估模型，使用config中定义的路径
-                    self.best_tokenizer_test_loss, eval_info = evaluate_models_during_training(
-                        epoch_idx=epoch_idx,
-                        current_model_path=temp_save_path,
-                        config=self.config,
-                        test_data=self.test_data,
-                        device=self.device,
-                        model_type='tokenizer',
-                        best_loss=self.best_tokenizer_test_loss,
-                        save_path=self.config.finetuned_tokenizer_path
-                    )
-                    
-                    # 记录评估信息
-                    evaluation_history.append(eval_info)
-                    
-                    # 清理临时模型文件（节省磁盘空间）
-                    shutil.rmtree(temp_save_path, ignore_errors=True)
-                    
-                    # 记录到Comet（如果启用）
-                    if comet_logger and os.path.exists(self.config.finetuned_tokenizer_path):
-                        comet_logger.log_model("best_model", self.config.finetuned_tokenizer_path)
+                # 保存当前模型到临时路径用于评估
+                model.save_pretrained(temp_save_path)
                 
-                # 如果没有测试数据，则使用验证损失作为标准
-                elif avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    save_path = self.config.finetuned_tokenizer_path
-                    model.save_pretrained(save_path)
-                    logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
-                    if comet_logger:
-                        comet_logger.log_model("best_model", save_path)
+                # 使用工具函数评估模型，使用config中定义的路径
+                self.best_tokenizer_test_loss, eval_info = evaluate_models_during_training(
+                    epoch_idx=epoch_idx,
+                    current_model_path=temp_save_path,
+                    config=self.config,
+                    test_data=self.test_data,
+                    device=self.device,
+                    model_type='tokenizer',
+                    best_loss=self.best_tokenizer_test_loss,
+                    save_path=self.config.finetuned_tokenizer_path
+                )
+                
+                # 记录评估信息
+                evaluation_history.append(eval_info)
+                
+                # 清理临时模型文件（节省磁盘空间）
+                shutil.rmtree(temp_save_path, ignore_errors=True)
+                
+                # 记录到Comet（如果启用）
+                if comet_logger and os.path.exists(self.config.finetuned_tokenizer_path):
+                    comet_logger.log_model("best_model", self.config.finetuned_tokenizer_path)
+            
+            # 如果没有测试数据，则使用验证损失作为标准
+            elif avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_path = self.config.finetuned_tokenizer_path
+                model.save_pretrained(save_path)
+                logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
+                if comet_logger:
+                    comet_logger.log_model("best_model", save_path)
             
             # 基于测试集的提前终止逻辑
             if hasattr(self, 'test_data') and self.test_data is not None:
@@ -698,6 +699,11 @@ class KronosTrainingPipeline:
                 logger.info(f"最佳分词模型测试损失: {self.best_tokenizer_test_loss:.4f}")
             else:
                 logger.warning(f"最佳模型路径不存在: {self.config.finetuned_tokenizer_path}")
+                # 如果最佳模型路径不存在，保存最后一个epoch的模型作为后备
+                logger.info(f"保存最后一个epoch的模型到: {self.config.finetuned_tokenizer_path}")
+                os.makedirs(self.config.finetuned_tokenizer_path, exist_ok=True)
+                model.save_pretrained(self.config.finetuned_tokenizer_path)
+                logger.info(f"已保存最后一个epoch的模型作为最佳模型")
             
             if comet_logger:
                 comet_logger.end()
@@ -872,48 +878,49 @@ class KronosTrainingPipeline:
             logger.info(f"本轮用时: {format_time(time.time() - epoch_start_time)}")
             logger.info(f"总用时: {format_time(time.time() - start_time)}\n")
             
+            # 记录到Comet（如果启用）
             if comet_logger:
                 comet_logger.log_metric('val_predictor_loss_epoch', avg_val_loss, epoch=epoch_idx)
+            
+            # 在测试集上评估当前模型（无论是否启用comet_logger都要执行）
+            if hasattr(self, 'test_data') and self.test_data is not None:
+                # 创建临时路径用于当前模型评估，包含epoch信息
+                temp_save_path = f"{self.predictor_save_dir}/checkpoints/current_model_epoch_{epoch_idx + 1}"
+                os.makedirs(temp_save_path, exist_ok=True)
                 
-                # 在测试集上评估当前模型
-                if hasattr(self, 'test_data') and self.test_data is not None:
-                    # 创建临时路径用于当前模型评估，包含epoch信息
-                    temp_save_path = f"{self.predictor_save_dir}/checkpoints/current_model_epoch_{epoch_idx + 1}"
-                    os.makedirs(temp_save_path, exist_ok=True)
-                    
-                    # 保存当前模型到临时路径用于评估
-                    model.save_pretrained(temp_save_path)
-                    
-                    # 使用工具函数评估模型，使用config中定义的路径
-                    self.best_predictor_test_loss, eval_info = evaluate_models_during_training(
-                        epoch_idx=epoch_idx,
-                        current_model_path=temp_save_path,
-                        config=self.config,
-                        test_data=self.test_data,
-                        device=self.device,
-                        model_type='predictor',
-                        best_loss=self.best_predictor_test_loss,
-                        save_path=self.config.finetuned_predictor_path
-                    )
-                    
-                    # 记录评估信息
-                    evaluation_history.append(eval_info)
-                    
-                    # 清理临时模型文件（节省磁盘空间）
-                    shutil.rmtree(temp_save_path, ignore_errors=True)
-                    
-                    # 记录到Comet（如果启用）
-                    if comet_logger and os.path.exists(self.config.finetuned_predictor_path):
-                        comet_logger.log_model("best_model", self.config.finetuned_predictor_path)
+                # 保存当前模型到临时路径用于评估
+                model.save_pretrained(temp_save_path)
                 
-                # 如果没有测试数据，则使用验证损失作为标准
-                elif avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    save_path = self.config.finetuned_predictor_path
-                    model.save_pretrained(save_path)
-                    logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
-                    if comet_logger:
-                        comet_logger.log_model("best_model", save_path)
+                # 使用工具函数评估模型，使用config中定义的路径
+                self.best_predictor_test_loss, eval_info = evaluate_models_during_training(
+                    epoch_idx=epoch_idx,
+                    current_model_path=temp_save_path,
+                    config=self.config,
+                    test_data=self.test_data,
+                    device=self.device,
+                    model_type='predictor',
+                    best_loss=self.best_predictor_test_loss,
+                    save_path=self.config.finetuned_predictor_path
+                )
+                
+                # 记录评估信息
+                evaluation_history.append(eval_info)
+                
+                # 清理临时模型文件（节省磁盘空间）
+                shutil.rmtree(temp_save_path, ignore_errors=True)
+                
+                # 记录到Comet（如果启用）
+                if comet_logger and os.path.exists(self.config.finetuned_predictor_path):
+                    comet_logger.log_model("best_model", self.config.finetuned_predictor_path)
+            
+            # 如果没有测试数据，则使用验证损失作为标准
+            elif avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_path = self.config.finetuned_predictor_path
+                model.save_pretrained(save_path)
+                logger.info(f"最佳模型已保存到 {save_path} (验证损失: {best_val_loss:.4f})")
+                if comet_logger:
+                    comet_logger.log_model("best_model", save_path)
             
             # 基于测试集的提前终止逻辑
             if hasattr(self, 'test_data') and self.test_data is not None:
@@ -964,6 +971,11 @@ class KronosTrainingPipeline:
                 logger.info(f"最佳预测模型测试损失: {self.best_predictor_test_loss:.4f}")
             else:
                 logger.warning(f"最佳模型路径不存在: {self.config.finetuned_predictor_path}")
+                # 如果最佳模型路径不存在，保存最后一个epoch的模型作为后备
+                logger.info(f"保存最后一个epoch的模型到: {self.config.finetuned_predictor_path}")
+                os.makedirs(self.config.finetuned_predictor_path, exist_ok=True)
+                model.save_pretrained(self.config.finetuned_predictor_path)
+                logger.info(f"已保存最后一个epoch的模型作为最佳模型")
             
             if comet_logger:
                 comet_logger.end()
