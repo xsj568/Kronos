@@ -442,28 +442,21 @@ def create_dataloaders_cpu(config: dict):
     Returns:
         tuple: (train_loader, val_loader, train_dataset, valid_dataset)
     """
-    logger.info("[CPU] 创建数据加载器...")
+    logger.info("[CPU] 创建数据加载器（单进程模式）...")
     train_dataset = FinancialDataset('train', config=config)
     valid_dataset = FinancialDataset('val', config=config)
     logger.info(f"[CPU] 训练数据集大小: {len(train_dataset)}, 验证数据集大小: {len(valid_dataset)}")
 
+    # 强制单进程模式：num_workers 必须为 0
     num_workers = config.get('num_workers', 0) or 0
-    
-    # 如果使用 DataParallel，必须将 num_workers 设置为 0，否则会导致死锁
-    # DataParallel 本身会创建多个进程，如果再使用多 worker 的 DataLoader，会导致进程间通信问题
-    use_data_parallel = config.get('use_data_parallel', False)
-    if use_data_parallel and num_workers > 0:
-        logger.warning(f"检测到使用 DataParallel 模式，将 num_workers 从 {num_workers} 调整为 0 以避免死锁")
+    if num_workers != 0:
+        logger.warning(f"检测到 num_workers={num_workers}，已强制调整为 0（单进程模式）")
         num_workers = 0
     
     pin_memory = False  # 在CPU上，pin_memory没有好处
-
-    # DataParallel模式下，添加multiprocessing_context='spawn'可以避免某些死锁问题
-    # 但num_workers=0时不需要设置
+    
+    # 单进程模式，不需要 multiprocessing_context
     mp_context = None
-    if num_workers > 0:
-        import multiprocessing
-        mp_context = multiprocessing.get_context('spawn')
     
     train_loader = DataLoader(
         train_dataset,
@@ -1174,6 +1167,20 @@ def evaluate_model_on_test_data(model, tokenizer, test_data, config, device):
             self.time_feature_list = self.config.time_feature_list
             self.indices = []
             self.py_rng = random.Random(self.config.seed)
+            
+            # 初始化锁相关属性，与FinancialDataset保持一致
+            # 注意：线程锁无法在多进程DataLoader中序列化（pickle）
+            # 只有在单线程（num_workers=0）或DataParallel多线程环境下才需要锁
+            import threading
+            num_workers = getattr(self.config, 'num_workers', 0) or 0
+            if num_workers == 0:
+                # 单线程模式，使用锁保护（用于DataParallel多线程场景）
+                self._lock = threading.Lock()
+                self._use_lock = True
+            else:
+                # 多进程模式，不使用锁（每个进程有独立实例）
+                self._lock = None
+                self._use_lock = False
             
             # 预处理数据 - 与FinancialDataset保持完全一致的逻辑
             for symbol in self.symbols:

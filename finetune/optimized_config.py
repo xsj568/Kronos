@@ -259,10 +259,10 @@ class OptimizedConfig:
         # 提前终止配置
         self.early_stopping_patience = 3  # 从6减少到3，加快早停
         
-        # CPU多核优化配置
-        self.num_workers = 4  # DataLoader的worker数量，默认4（优化后的值，避免创建过多子进程）
+        # CPU多核优化配置（单进程模式）
+        self.num_workers = 0  # DataLoader的worker数量，强制为0（单进程模式，避免多进程问题）
         self.torch_threads = 0  # PyTorch计算线程数，默认0表示自动，建议设置为物理核心数
-        self.max_num_workers = 8  # num_workers的最大值限制，避免创建过多子进程
+        self.max_num_workers = 0  # num_workers的最大值限制，强制为0（单进程模式）
         self.use_torch_compile = False  # 是否使用torch.compile()加速（PyTorch 2.0+）
         self.torch_compile_mode = 'default'  # torch.compile模式: 'default', 'reduce-overhead', 'max-autotune'
         
@@ -434,10 +434,10 @@ class OptimizedConfig:
         if self.tokenizer_learning_rate <= 0 or self.predictor_learning_rate <= 0:
             raise ValueError("学习率必须大于0")
         
-        # 验证和限制 num_workers，避免创建过多子进程
-        if self.num_workers > self.max_num_workers:
-            logger.warning(f"num_workers ({self.num_workers}) 超过最大限制 ({self.max_num_workers})，已自动调整为 {self.max_num_workers}")
-            self.num_workers = self.max_num_workers
+        # 验证和限制 num_workers，强制单进程模式
+        if self.num_workers != 0:
+            logger.warning(f"num_workers ({self.num_workers}) 已强制调整为 0（单进程模式）")
+            self.num_workers = 0
         if self.num_workers < 0:
             logger.warning(f"num_workers ({self.num_workers}) 不能为负数，已调整为 0")
             self.num_workers = 0
@@ -556,9 +556,9 @@ def parse_args():
     parser.add_argument('--kill-existing', action='store_true', default=False,
                         help='启动前自动清理已存在的训练进程（默认不清理）')
     
-    # CPU多核优化参数
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='DataLoader的worker进程数，建议设置为4-8（默认4，避免创建过多子进程）')
+    # CPU多核优化参数（单进程模式）
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='DataLoader的worker进程数，强制为0（单进程模式，避免多进程问题）')
     parser.add_argument('--torch-threads', type=int, default=28,
                         help='PyTorch计算线程数，建议设置为物理核心数（默认28）')
     parser.add_argument('--use-torch-compile', action='store_true', default=False,
