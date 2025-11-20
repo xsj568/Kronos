@@ -589,6 +589,10 @@ def parse_args():
     parser.add_argument('--max-logs-per-epoch', type=int, default=30,
                         help='每个epoch最多打印的日志次数，自动计算实际间隔（默认30）')
     
+    # 日志时间戳参数
+    parser.add_argument('--start-timestamp', type=str, default=None,
+                        help='脚本启动时的日期（格式：YYYYMMDD）或时间戳（格式：YYYYMMDD_HHMMSS），用于统一日志文件名后缀。如果未提供，则使用当前日期。即使脚本跨天运行，也使用启动时的日期')
+    
     return parser.parse_args()
 
 

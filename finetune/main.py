@@ -1309,7 +1309,8 @@ def main():
     top_k = getattr(args, 'top_k_stocks', None)
     model_ver = getattr(args, 'model_version', None)
     data_source = getattr(args, 'data_source', None)
-    setup_logging(top_k_stocks=top_k, data_source=data_source, model_version=model_ver)
+    start_timestamp = getattr(args, 'start_timestamp', None)
+    setup_logging(top_k_stocks=top_k, data_source=data_source, model_version=model_ver, start_timestamp=start_timestamp)
     
     # 设置信号处理器
     setup_signal_handlers()

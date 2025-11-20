@@ -111,8 +111,12 @@ NUM_GPUS=1  # GPU数量：0=使用所有可用GPU, 1=单GPU(推荐), 2+=指定GP
 LOG_DIR="./logs"
 mkdir -p "$LOG_DIR" || exit 1
 
+# 生成脚本启动时的日期（统一用于所有日志文件，即使跨天也不变）
+START_DATE=$(date +%Y%m%d)
+
 # Cron执行日志文件（记录整个脚本的执行过程，包括错误）
-CRON_LOG="$LOG_DIR/cron_$(date +%Y%m%d)_${DATA_SOURCE}_${MODEL_VERSION}_k${TOP_K_STOCKS}.log"
+# 使用启动日期，即使脚本跨天运行也使用同一个日志文件
+CRON_LOG="$LOG_DIR/cron_${START_DATE}_${DATA_SOURCE}_${MODEL_VERSION}_k${TOP_K_STOCKS}.log"
 
 # 将所有输出（包括错误）重定向到日志文件
 exec >> "$CRON_LOG" 2>&1
@@ -177,8 +181,8 @@ export NUMEXPR_NUM_THREADS=28
 # CUDA_VISIBLE_DEVICES 不设置，允许使用GPU（如果需要禁用GPU，可以设置 export CUDA_VISIBLE_DEVICES=""）
 
 # 训练日志文件（会由Python程序自动创建，包含数据源、模型版本和股票数量）
-# 实际文件名格式：training_20251101_sina_base_k3000.log
-TRAIN_LOG="$LOG_DIR/training_$(date +%Y%m%d)_${DATA_SOURCE}_${MODEL_VERSION}_k${TOP_K_STOCKS}.log"
+# 实际文件名格式：training_20251120_sina_base_k3000.log（使用启动日期，即使跨天也不变）
+TRAIN_LOG="$LOG_DIR/training_${START_DATE}_${DATA_SOURCE}_${MODEL_VERSION}_k${TOP_K_STOCKS}.log"
 
 echo "配置参数："
 echo "  - 数据源: $DATA_SOURCE"
@@ -187,6 +191,7 @@ echo "  - 股票数量: $TOP_K_STOCKS"
 echo "  - Worker数: $NUM_WORKERS"
 echo "  - 线程数: $TORCH_THREADS"
 echo "  - 最大重试: $MAX_RETRIES"
+echo "  - 启动日期: $START_DATE（日志文件将使用此日期，即使跨天也不变）"
 echo ""
 
 # 检查并自动清理旧训练进程
@@ -250,7 +255,8 @@ train_model() {
             --torch-threads "$TORCH_THREADS" \
             --early-stopping-patience "$EARLY_STOPPING_PATIENCE" \
             --min-gpu-memory 3.0 \
-            --log-interval 1 2>&1
+            --log-interval 1 \
+            --start-timestamp "$START_DATE" 2>&1
     else
         # 单GPU或CPU训练：直接使用python
         if [ "$ACTUAL_NUM_GPUS" -eq 1 ]; then
@@ -268,7 +274,8 @@ train_model() {
             --torch-threads "$TORCH_THREADS" \
             --early-stopping-patience "$EARLY_STOPPING_PATIENCE" \
             --min-gpu-memory 3.0 \
-            --log-interval 1 2>&1
+            --log-interval 1 \
+            --start-timestamp "$START_DATE" 2>&1
     fi
     
     local exit_code=$?

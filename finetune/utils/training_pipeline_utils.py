@@ -98,10 +98,11 @@ _LOG_CONFIG = None  # 保存日志配置参数（data_source, model_version, top
 
 class DateRotatingFileHandler(logging.FileHandler):
     """
-    自动按日期切换的FileHandler
-    当日志跨天时，自动切换到新日期的日志文件
+    使用固定日期的FileHandler
+    使用脚本启动时的日期作为日志文件名后缀，不会因日期变化而切换文件
+    即使脚本跨天运行，也始终写入启动时创建的日志文件
     """
-    def __init__(self, log_dir, data_source, model_version, top_k_stocks, mode='a', encoding='utf-8'):
+    def __init__(self, log_dir, data_source, model_version, top_k_stocks, start_timestamp=None, mode='a', encoding='utf-8'):
         self.log_dir = log_dir
         self.data_source = data_source
         self.model_version = model_version
@@ -114,20 +115,26 @@ class DateRotatingFileHandler(logging.FileHandler):
             from datetime import timezone
             self.shanghai_tz = timezone(timedelta(hours=8))
         
-        # 初始化时创建第一个日志文件
+        # 如果提供了start_timestamp，使用它；否则使用当前日期
+        if start_timestamp:
+            # 如果时间戳包含下划线（YYYYMMDD_HHMMSS格式），只取日期部分
+            if '_' in start_timestamp:
+                self.start_timestamp = start_timestamp.split('_')[0]
+            else:
+                # 已经是日期格式（YYYYMMDD），直接使用
+                self.start_timestamp = start_timestamp
+        else:
+            # 如果没有提供时间戳，使用当前日期（兼容旧代码）
+            current_time = datetime.now(self.shanghai_tz)
+            self.start_timestamp = current_time.strftime('%Y%m%d')
+        
+        # 初始化时创建日志文件
         initial_filepath = self._get_log_filepath()
         super().__init__(initial_filepath, mode, encoding)
-        self.current_date = self._get_current_date()
-        
-    def _get_current_date(self):
-        """获取当前日期字符串"""
-        current_time = datetime.now(self.shanghai_tz)
-        return current_time.strftime('%Y%m%d')
     
     def _get_log_filepath(self):
-        """根据当前日期生成日志文件路径"""
-        date_str = self._get_current_date()
-        filename_parts = ['training', date_str]
+        """根据启动时间戳生成日志文件路径"""
+        filename_parts = ['training', self.start_timestamp]
         if self.data_source:
             filename_parts.append(self.data_source)
         if self.model_version:
@@ -139,33 +146,7 @@ class DateRotatingFileHandler(logging.FileHandler):
         return os.path.join(self.log_dir, log_filename)
     
     def emit(self, record):
-        """发送日志记录，如果日期变化则切换文件"""
-        # 检查日期是否变化
-        current_date = self._get_current_date()
-        if current_date != self.current_date:
-            # 日期变化，切换到新文件
-            old_filepath = self.baseFilename
-            new_filepath = self._get_log_filepath()
-            
-            # 关闭旧文件
-            self.close()
-            
-            # 打开新文件
-            self.baseFilename = new_filepath
-            self.stream = self._open()
-            self.current_date = current_date
-            
-            # 记录切换信息（使用控制台输出，避免递归）
-            import sys
-            old_stdout = sys.stdout
-            try:
-                with open(new_filepath, 'a', encoding='utf-8') as f:
-                    f.write(f"{datetime.now(self.shanghai_tz).strftime('%Y-%m-%d %H:%M:%S')} | INFO     | training_pipeline_utils.py | DateRotatingFileHandler.emit() | 检测到日期变化，已切换到新的日志文件 - 新文件: {new_filepath} (上海时区)\n")
-                    if old_filepath:
-                        f.write(f"{datetime.now(self.shanghai_tz).strftime('%Y-%m-%d %H:%M:%S')} | INFO     | training_pipeline_utils.py | DateRotatingFileHandler.emit() | 旧日志文件已停止记录: {old_filepath}\n")
-            except Exception:
-                pass
-        
+        """发送日志记录（使用固定时间戳，不会切换文件）"""
         # 调用父类方法写入日志
         super().emit(record)
         # 立即刷新日志，确保日志及时写入文件，避免看起来卡住
@@ -175,10 +156,10 @@ class DateRotatingFileHandler(logging.FileHandler):
         except Exception:
             pass
 
-def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, data_source=None, model_version=None):
+def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, data_source=None, model_version=None, start_timestamp=None):
     """
-    设置日志配置，使用上海时区，保存到文件（带日期和股票数量后缀）
-    支持跨日期自动切换日志文件：如果日期变化，会自动添加新的文件处理器
+    设置日志配置，使用上海时区，保存到文件（带启动日期和股票数量后缀）
+    使用脚本启动时的日期作为日志文件名后缀，不会因日期变化而切换文件
     
     Args:
         log_level: 日志级别
@@ -186,6 +167,7 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
         top_k_stocks: 股票池数量（可选，如果提供则加入文件名）
         data_source: 数据源（可选）
         model_version: 模型版本（可选）
+        start_timestamp: 脚本启动时的日期（格式：YYYYMMDD）或时间戳（格式：YYYYMMDD_HHMMSS），如果为None则使用当前日期
     """
     import pytz
     
@@ -197,12 +179,21 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     # 创建日志目录
     os.makedirs(log_dir, exist_ok=True)
     
-    # 生成带日期和股票数量后缀的日志文件名（使用上海时间）
-    current_time = datetime.now(shanghai_tz)
-    date_str = current_time.strftime('%Y%m%d')
+    # 如果提供了start_timestamp，使用它；否则使用当前日期
+    if start_timestamp:
+        # 如果时间戳包含下划线（YYYYMMDD_HHMMSS格式），只取日期部分
+        if '_' in start_timestamp:
+            timestamp_str = start_timestamp.split('_')[0]
+        else:
+            # 已经是日期格式（YYYYMMDD），直接使用
+            timestamp_str = start_timestamp
+    else:
+        # 如果没有提供时间戳，使用当前日期（兼容旧代码）
+        current_time = datetime.now(shanghai_tz)
+        timestamp_str = current_time.strftime('%Y%m%d')
     
-    # 构建文件名：training_20251101_sina_base_k3000.log
-    filename_parts = ['training', date_str]
+    # 构建文件名：training_20251120_sina_base_k3000.log
+    filename_parts = ['training', timestamp_str]
     if data_source:
         filename_parts.append(data_source)
     if model_version:
@@ -213,7 +204,7 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     log_filename = '_'.join(filename_parts) + '.log'
     log_filepath = os.path.join(log_dir, log_filename)
     
-    # 如果已初始化，直接返回已存在的logger（DateRotatingFileHandler会自动处理日期切换）
+    # 如果已初始化，直接返回已存在的logger
     if _LOGGING_INITIALIZED and _LOGGING_INSTANCE is not None:
         return _LOGGING_INSTANCE
     
@@ -267,15 +258,17 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     _LOG_CONFIG = {
         'data_source': data_source,
         'model_version': model_version,
-        'top_k_stocks': top_k_stocks
+        'top_k_stocks': top_k_stocks,
+        'start_timestamp': timestamp_str
     }
     
-    # 添加自动按日期切换的文件处理器
+    # 添加使用固定时间戳的文件处理器
     file_handler = DateRotatingFileHandler(
         log_dir=log_dir,
         data_source=data_source,
         model_version=model_version,
         top_k_stocks=top_k_stocks,
+        start_timestamp=timestamp_str,
         mode='a',
         encoding='utf-8'
     )
@@ -285,13 +278,13 @@ def setup_logging(log_level=logging.INFO, log_dir='./logs', top_k_stocks=None, d
     file_handler.flush = lambda: file_handler.stream.flush() if file_handler.stream else None
     root_logger.addHandler(file_handler)
     
-    # 标记为已初始化并保存logger实例和日期信息
+    # 标记为已初始化并保存logger实例和时间戳信息
     _LOGGING_INITIALIZED = True
     _LOGGING_INSTANCE = kronos_logger
-    _CURRENT_LOG_DATE = date_str
+    _CURRENT_LOG_DATE = timestamp_str
     _CURRENT_LOG_FILEPATH = log_filepath
     
-    kronos_logger.info(f"日志系统初始化完成 - 文件: {log_filepath} (上海时区)")
+    kronos_logger.info(f"日志系统初始化完成 - 文件: {log_filepath} (启动日期: {timestamp_str}, 即使跨天也不切换, 上海时区)")
     
     return kronos_logger
 
