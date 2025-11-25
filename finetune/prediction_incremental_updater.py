@@ -10,10 +10,23 @@ import os
 import logging
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import traceback
+import requests
+import time
+import sys
+
+# 添加utils路径以导入get_shanghai_time
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from utils.training_pipeline_utils import get_shanghai_time
+except ImportError:
+    # 如果导入失败，使用简单的实现
+    def get_shanghai_time():
+        from datetime import timezone
+        return datetime.now(timezone(timedelta(hours=8)))
 
 # 设置日志
 logger = logging.getLogger('KronosPipeline')
@@ -155,6 +168,14 @@ class PredictionIncrementalUpdater:
             # 合并数据
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
             
+            # 回填历史记录的真实数据（在保存前完成）
+            logger.info("开始回填历史预测记录的真实数据...")
+            updated_df = self.backfill_real_data(combined_df)
+            
+            # 如果回填了数据，使用更新后的DataFrame
+            if updated_df is not None:
+                combined_df = updated_df
+            
             # 按生成日期、最新日期、预测日期降序排列（最新的在前面）
             if not combined_df.empty:
                 sort_columns = ['生成日期', '最新日期', '预测日期']
@@ -280,6 +301,145 @@ class PredictionIncrementalUpdater:
         except Exception as e:
             logger.error(f"获取最近预测记录失败: {str(e)}")
             return pd.DataFrame()
+    
+    def get_real_stock_data(self, stock_code: str, target_date: str) -> Optional[Dict]:
+        """
+        从sina API获取指定股票在指定日期的真实数据
+        
+        Args:
+            stock_code: 股票代码
+            target_date: 目标日期，格式为'YYYY-MM-DD'
+        
+        Returns:
+            dict: 包含真实数据的字典，格式为 {'open': float, 'high': float, 'low': float, 'close': float, 'volume': int}
+                 如果获取失败则返回None
+        """
+        try:
+            url = f"http://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol={stock_code}&___qn=3n"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code != 200:
+                return None
+            
+            data_json = response.json()
+            if not data_json:
+                return None
+            
+            # 查找目标日期的数据
+            target_date_obj = pd.to_datetime(target_date)
+            for item in data_json:
+                date_str = item.get('d', '')
+                if not date_str or date_str.startswith('0000-00-00'):
+                    continue
+                
+                try:
+                    item_date = pd.to_datetime(date_str)
+                    if item_date.date() == target_date_obj.date():
+                        return {
+                            'open': float(item.get('o', 0)),
+                            'high': float(item.get('h', 0)),
+                            'low': float(item.get('l', 0)),
+                            'close': float(item.get('c', 0)),
+                            'volume': int(item.get('v', 0))
+                        }
+                except (ValueError, TypeError):
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"获取股票 {stock_code} 在 {target_date} 的真实数据失败: {str(e)}")
+            return None
+    
+    def backfill_real_data(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        回填历史预测记录的真实数据
+        
+        Args:
+            df: 预测数据DataFrame
+        
+        Returns:
+            pd.DataFrame: 更新后的DataFrame，如果无需更新则返回None
+        """
+        try:
+            if df.empty:
+                return None
+            
+            # 获取当前日期（使用上海时间，用于判断预测日期是否已过去）
+            shanghai_time = get_shanghai_time()
+            today = shanghai_time.date()
+            
+            # 检查哪些记录需要回填
+            updated_df = df.copy()
+            
+            # 找出需要回填的记录（预测日期已过去，但真实数据为空）
+            mask = (
+                (pd.to_datetime(updated_df['预测日期'], errors='coerce').dt.date < today) &
+                (updated_df['真实开盘价'].isna() | updated_df['真实收盘价'].isna())
+            )
+            
+            records_to_backfill = updated_df[mask]
+            
+            if records_to_backfill.empty:
+                logger.info("  没有需要回填的历史记录")
+                return None
+            
+            logger.info(f"  找到 {len(records_to_backfill)} 条需要回填的记录")
+            
+            # 按股票代码和预测日期分组，避免重复请求
+            unique_stocks_dates = records_to_backfill[['股票代码', '预测日期']].drop_duplicates()
+            
+            success_count = 0
+            fail_count = 0
+            
+            for _, row in unique_stocks_dates.iterrows():
+                stock_code = row['股票代码']
+                predict_date = row['预测日期']
+                
+                # 获取真实数据
+                real_data = self.get_real_stock_data(stock_code, predict_date)
+                
+                if real_data:
+                    # 更新所有匹配的记录
+                    update_mask = (
+                        (updated_df['股票代码'] == stock_code) &
+                        (updated_df['预测日期'] == predict_date)
+                    )
+                    
+                    updated_df.loc[update_mask, '真实开盘价'] = real_data['open']
+                    updated_df.loc[update_mask, '真实最高价'] = real_data['high']
+                    updated_df.loc[update_mask, '真实最低价'] = real_data['low']
+                    updated_df.loc[update_mask, '真实收盘价'] = real_data['close']
+                    updated_df.loc[update_mask, '真实成交量'] = real_data['volume']
+                    
+                    # 计算预测误差
+                    for idx in updated_df[update_mask].index:
+                        pred_open = updated_df.loc[idx, '预测开盘价']
+                        pred_close = updated_df.loc[idx, '预测收盘价']
+                        real_open = real_data['open']
+                        real_close = real_data['close']
+                        
+                        if pd.notna(pred_open) and real_open > 0:
+                            updated_df.loc[idx, '开盘价误差(%)'] = ((pred_open - real_open) / real_open) * 100
+                        
+                        if pd.notna(pred_close) and real_close > 0:
+                            updated_df.loc[idx, '收盘价误差(%)'] = ((pred_close - real_close) / real_close) * 100
+                    
+                    success_count += 1
+                else:
+                    fail_count += 1
+                
+                # 避免请求过快
+                time.sleep(0.1)
+            
+            logger.info(f"  回填完成: 成功 {success_count} 条, 失败 {fail_count} 条")
+            
+            return updated_df
+            
+        except Exception as e:
+            logger.error(f"回填真实数据失败: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
     
     def export_to_csv(self, csv_path: Optional[str] = None):
         """
