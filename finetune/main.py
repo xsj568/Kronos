@@ -359,6 +359,8 @@ class KronosTrainingPipeline:
             data_exists = all(os.path.exists(p) for p in [train_path, val_path, test_path])
             
             # 如果数据文件存在，检查股票数量是否匹配配置
+            # 注意：如果之前用的是 1000 支股票，现在改成 100，
+            #      也需要重新处理数据，否则会继续复用旧的 1000 股数据
             if data_exists and not self.config.force_download_data:
                 try:
                     import pickle
@@ -367,19 +369,24 @@ class KronosTrainingPipeline:
                     actual_stock_count = len(train_data) if isinstance(train_data, dict) else 0
                     expected_stock_count = getattr(self.config, 'top_k_stocks', 0)
                     
-                    # 如果实际股票数量少于配置的top_k_stocks，强制重新处理
-                    if expected_stock_count > 0 and actual_stock_count < expected_stock_count:
-                        logger.warning(f"检测到数据文件中的股票数量({actual_stock_count})少于配置的top_k_stocks({expected_stock_count})")
-                        logger.warning(f"将强制重新处理数据以匹配配置")
+                    # 如果实际股票数量与配置不一致，则强制重新处理
+                    # 场景举例：
+                    #   - 之前是 top_k_stocks=1000，后来改成 100（actual=1000, expected=100）
+                    #   - 之前是 3000，后来改成 1000（actual=3000, expected=1000）
+                    # 这些情况下都应该重新跑一遍数据处理和选股逻辑
+                    if expected_stock_count > 0 and actual_stock_count != expected_stock_count:
+                        logger.warning(
+                            f\"检测到数据文件中的股票数量({actual_stock_count})与当前配置的top_k_stocks({expected_stock_count})不一致\")
+                        logger.warning(\"将强制重新处理数据以匹配最新的股票池配置\")
                         self.config.force_download_data = True
                         data_exists = False
                     else:
-                        logger.info(f"检测到已存在的{self.data_source}数据文件，包含 {actual_stock_count} 支股票，跳过下载和处理")
-                        logger.info(f"数据存储路径:")
-                        logger.info(f"  - 训练数据: {train_path}")
-                        logger.info(f"  - 验证数据: {val_path}")
-                        logger.info(f"  - 测试数据: {test_path}")
-                        logger.info(f"如需重新下载数据，请使用 --force_download_data 参数或删除上述文件")
+                        logger.info(f\"检测到已存在的{self.data_source}数据文件，包含 {actual_stock_count} 支股票，跳过下载和处理\")
+                        logger.info(\"数据存储路径:\")
+                        logger.info(f\"  - 训练数据: {train_path}\")
+                        logger.info(f\"  - 验证数据: {val_path}\")
+                        logger.info(f\"  - 测试数据: {test_path}\")
+                        logger.info(\"如需重新下载数据，请使用 --force_download_data 参数或删除上述文件\")
                 except Exception as e:
                     logger.warning(f"检查数据文件时出错: {e}，将重新处理数据")
                     self.config.force_download_data = True
