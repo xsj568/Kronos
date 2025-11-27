@@ -271,7 +271,8 @@ class OptimizedConfig:
         self.use_all_available_gpus = True  # 是否使用所有符合条件的GPU（用于DataParallel）
         
         # 股票选择配置
-        self.top_k_stocks = 1000  # 选择TopK活跃股票数量（默认1000，与定时任务保持一致）
+        # 默认使用最活跃的 Top-100 股票，并通过缓存文件固定股票池
+        self.top_k_stocks = 100  # 选择TopK活跃股票数量（默认100，与定时任务保持一致）
         self.stock_selection_days = 180  # 基于最近N天的数据选择股票，从365减少到180天（半年），加快股票选择速度
         self.stock_cache_file = None  # 股票代码缓存文件名（自动根据top_k生成: selected_stocks_{top_k}.json）
         self.use_stock_cache = True  # 是否使用缓存的股票列表（True: 从缓存读取, False: 重新选择）
@@ -576,8 +577,8 @@ def parse_args():
                         help='使用的GPU数量（用于torchrun启动DDP训练）。默认None表示使用所有可用GPU')
     
     # 股票选择参数
-    parser.add_argument('--top-k-stocks', type=int, default=1000,
-                        help='选择TopK活跃股票数量（默认1000）')
+    parser.add_argument('--top-k-stocks', type=int, default=100,
+                        help='选择TopK活跃股票数量（默认100）')
     parser.add_argument('--stock-selection-days', type=int, default=365,
                         help='基于最近N天的数据选择股票（默认365天）')
     parser.add_argument('--no-stock-cache', action='store_true', default=False,

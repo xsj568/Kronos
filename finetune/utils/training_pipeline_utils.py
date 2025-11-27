@@ -635,29 +635,67 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                     'month': [d.month for d in future_datetimes]
                 })
                 
-                # 提取特征
-                x = context_df[self.feature_list].values.astype(np.float32)
+                # 提取**原始**特征并计算标准化参数
+                raw_x = context_df[self.feature_list].values.astype(np.float32)
+                x_mean, x_std = np.mean(raw_x, axis=0), np.std(raw_x, axis=0)
+                # 避免除以 0
+                x_std_safe = x_std + 1e-5
+                
+                # 标准化后送入模型
+                x = (raw_x - x_mean) / x_std_safe
+                x = np.clip(x, -self.config.clip, self.config.clip)
+                
                 x_stamp = context_df[self.time_feature_list].values.astype(np.float32)
                 y_stamp = future_features[self.time_feature_list].values.astype(np.float32)
                 
-                # 标准化
-                x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
-                x = (x - x_mean) / (x_std + 1e-5)
-                x = np.clip(x, -self.config.clip, self.config.clip)
+                # 保存最后一天的**原始**特征，以及均值和方差，便于后续反归一化
+                last_raw_features = raw_x[-1].astype(np.float32)
                 
-                # 返回数据，包括最后日期和未来日期
-                return torch.from_numpy(x), torch.from_numpy(x_stamp), torch.from_numpy(y_stamp), symbol, last_date, future_dates
+                return (
+                    torch.from_numpy(x),
+                    torch.from_numpy(x_stamp),
+                    torch.from_numpy(y_stamp),
+                    symbol,
+                    last_date,
+                    future_dates,
+                    torch.from_numpy(last_raw_features),
+                    torch.from_numpy(x_mean.astype(np.float32)),
+                    torch.from_numpy(x_std_safe.astype(np.float32)),
+                )
         
         # 创建预测数据集和数据加载器
         pred_dataset = PredictionDataset(test_data, config)
         
         # 定义collate函数
         def collate_fn(batch):
-            x, x_stamp, y_stamp, symbols, last_dates, future_dates_list = zip(*batch)
+            (
+                x,
+                x_stamp,
+                y_stamp,
+                symbols,
+                last_dates,
+                future_dates_list,
+                last_raw_features,
+                x_means,
+                x_stds,
+            ) = zip(*batch)
             x_batch = torch.stack(x, dim=0)
             x_stamp_batch = torch.stack(x_stamp, dim=0)
             y_stamp_batch = torch.stack(y_stamp, dim=0)
-            return x_batch, x_stamp_batch, y_stamp_batch, list(symbols), list(last_dates), list(future_dates_list)
+            last_raw_batch = torch.stack(last_raw_features, dim=0)
+            x_means_batch = torch.stack(x_means, dim=0)
+            x_stds_batch = torch.stack(x_stds, dim=0)
+            return (
+                x_batch,
+                x_stamp_batch,
+                y_stamp_batch,
+                list(symbols),
+                list(last_dates),
+                list(future_dates_list),
+                last_raw_batch,
+                x_means_batch,
+                x_stds_batch,
+            )
         
         pred_loader = torch.utils.data.DataLoader(
             pred_dataset,
@@ -672,7 +710,17 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
         detailed_results = []  # 存储详细的预测结果
         
         with torch.no_grad():
-            for x, x_stamp, y_stamp, symbols, last_dates, future_dates_list in pred_loader:
+            for (
+                x,
+                x_stamp,
+                y_stamp,
+                symbols,
+                last_dates,
+                future_dates_list,
+                last_raw_batch,
+                x_means_batch,
+                x_stds_batch,
+            ) in pred_loader:
                 # 使用自回归推理进行预测
                 preds = auto_regressive_inference(
                     tokenizer, model, x.to(device), x_stamp.to(device), y_stamp.to(device),
@@ -688,6 +736,13 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                 # 只保留预测窗口的数据
                 preds = preds[:, -config.predict_window:, :]
                 
+                # 将预测结果从标准化空间反归一化回真实价格/成交量空间
+                # x_means_batch / x_stds_batch 形状: (batch, feature_dim)
+                x_means_np = x_means_batch.numpy()
+                x_stds_np = x_stds_batch.numpy()
+                preds_np = preds.cpu().numpy()
+                preds_denorm = preds_np * x_stds_np[:, None, :] + x_means_np[:, None, :]
+                
                 # 获取特征在 feature_list 中的索引
                 # feature_list = ['open', 'high', 'low', 'close', 'vol', 'amt']
                 feature_names = ['open', 'high', 'low', 'close', 'volume', 'amount']
@@ -700,18 +755,19 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                     'amount': 5
                 }
                 
-                # 获取最后一天的所有特征值
+                # 获取最后一天的**原始**特征值（真实价格/成交量）
+                last_raw_np = last_raw_batch.numpy()
                 last_day_features = {}
                 for feat_name, feat_idx in feature_indices.items():
-                    last_day_features[feat_name] = x[:, -1, feat_idx].numpy()
+                    last_day_features[feat_name] = last_raw_np[:, feat_idx]
                 
-                # 计算基于close价格的信号类型（用于排序和筛选）
+                # 计算基于真实 close 价格的信号类型（用于排序和筛选）
                 last_day_close = last_day_features['close']
                 signals = {
-                    'last': preds[:, -1, 3] - last_day_close,
-                    'mean': np.mean(preds[:, :, 3], axis=1) - last_day_close,
-                    'max': np.max(preds[:, :, 3], axis=1) - last_day_close,
-                    'min': np.min(preds[:, :, 3], axis=1) - last_day_close,
+                    'last': preds_denorm[:, -1, 3] - last_day_close,
+                    'mean': np.mean(preds_denorm[:, :, 3], axis=1) - last_day_close,
+                    'max': np.max(preds_denorm[:, :, 3], axis=1) - last_day_close,
+                    'min': np.min(preds_denorm[:, :, 3], axis=1) - last_day_close,
                 }
                 
                 # 收集结果
@@ -724,7 +780,7 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                     last_date = last_dates[i]
                     future_dates = future_dates_list[i]
                     
-                    # 为每支股票创建一个详细记录
+                    # 为每支股票创建一个详细记录（所有数值均为真实价格/成交量）
                     detail_record = {
                         'stock_code': symbol,
                         'last_data_date': last_date.strftime('%Y-%m-%d'),  # 最新数据日期
@@ -738,7 +794,7 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                     
                     # 使用该股票特定的未来日期
                     
-                    # 添加未来每一天的所有特征预测
+                    # 添加未来每一天的所有特征预测（已反归一化）
                     for day_idx in range(config.predict_window):
                         day_num = day_idx + 1
                         
@@ -748,7 +804,8 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                         
                         # 预测的所有特征值
                         for feat_name, feat_idx in feature_indices.items():
-                            pred_value = preds[i, day_idx, feat_idx]
+                            # 反归一化后的预测值（真实价格/成交量）
+                            pred_value = preds_denorm[i, day_idx, feat_idx]
                             current_value = last_day_features[feat_name][i]
                             
                             # 保存预测值

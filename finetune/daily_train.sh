@@ -25,7 +25,7 @@
 # 训练配置（可在脚本中修改）：
 #   DATA_SOURCE="sina"              # 数据源: sina, yfinance
 #   MODEL_VERSION="base"            # 模型版本: mini, small, base
-#   TOP_K_STOCKS=3000              # 训练股票数量
+#   TOP_K_STOCKS=100               # 训练股票数量（默认使用最活跃的100支）
 #   NUM_WORKERS=16                 # DataLoader工作进程数
 #   TORCH_THREADS=28               # PyTorch计算线程数
 #   EARLY_STOPPING_PATIENCE=3      # 提前停止的耐心值
@@ -38,10 +38,10 @@
 #   CRYPTOGRAPHY_OPENSSL_NO_LEGACY=1  # 解决OpenSSL兼容性
 #
 # 输出文件：
-#   训练日志: logs/training_YYYYMMDD_sina_base_k3000.log
-#   模型文件: outputs/sina/base_k3000/finetune_tokenizer/best_model/
-#            outputs/sina/base_k3000/finetune_predictor/best_model/
-#   预测文件: outputs/sina/base_k3000/predictions_master.xlsx
+#   训练日志: logs/training_YYYYMMDD_sina_base_k100.log
+#   模型文件: outputs/sina/base_k100/finetune_tokenizer/best_model/
+#            outputs/sina/base_k100/finetune_predictor/best_model/
+#   预测文件: outputs/sina/base_k100/predictions_master.xlsx
 #
 # 日志管理：
 #   - 训练日志会自动按日期命名
@@ -77,8 +77,8 @@
 #   - 如果内存不足，可以减少TOP_K_STOCKS或NUM_WORKERS
 #
 # 作者: Kronos Team
-# 版本: 2.0
-# 更新时间: 2025-11-02
+# 版本: 2.1
+# 更新时间: 2025-11-27
 ################################################################################
 
 # 设置错误处理：遇到错误不立即退出，而是记录并继续
@@ -100,7 +100,7 @@ export SHELL="/bin/bash"
 # 配置参数
 DATA_SOURCE="sina"
 MODEL_VERSION="base"
-TOP_K_STOCKS=1000
+TOP_K_STOCKS=100
 NUM_WORKERS=16
 TORCH_THREADS=28
 EARLY_STOPPING_PATIENCE=3
