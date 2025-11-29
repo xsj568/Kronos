@@ -184,6 +184,10 @@ class PredictionIncrementalUpdater:
                 if sort_columns:
                     combined_df = combined_df.sort_values(sort_columns, ascending=False).reset_index(drop=True)
             
+            # 计算涨幅相关列（在保存前完成）
+            logger.info("计算涨幅相关列...")
+            combined_df = self._calculate_price_change_columns(combined_df)
+            
             # 保存到Excel
             with pd.ExcelWriter(self.master_excel_path, engine='openpyxl') as writer:
                 # 保存主预测历史
@@ -205,6 +209,84 @@ class PredictionIncrementalUpdater:
             logger.error(f"追加预测结果失败: {str(e)}")
             logger.error(traceback.format_exc())
             return False
+    
+    def _calculate_price_change_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算涨幅相关列
+        
+        添加的列：
+        1. 预测最高价相对开盘价涨幅(%) = (预测最高价 - 预测开盘价) / 预测开盘价 * 100
+        2. 真实最高价相对开盘价涨幅(%) = (真实最高价 - 真实开盘价) / 真实开盘价 * 100 (如果有真实数据)
+        3. 涨幅误差(%) = 预测涨幅 - 真实涨幅
+        
+        Args:
+            df: 数据DataFrame
+            
+        Returns:
+            pd.DataFrame: 添加了涨幅列的DataFrame
+        """
+        try:
+            # 检查必要的列是否存在
+            if '预测开盘价' not in df.columns or '预测最高价' not in df.columns:
+                logger.warning("缺少必要的预测价格列，跳过涨幅计算")
+                return df
+            
+            # 1. 计算预测的最高价和预测的开盘价的涨幅
+            df['预测最高价相对开盘价涨幅(%)'] = np.where(
+                df['预测开盘价'] > 0,
+                (df['预测最高价'] - df['预测开盘价']) / df['预测开盘价'] * 100,
+                np.nan
+            )
+            
+            # 2. 计算真实的最高价和真实的开盘价的涨幅
+            has_real_open = '真实开盘价' in df.columns
+            has_real_high = '真实最高价' in df.columns
+            
+            if has_real_open and has_real_high:
+                # 如果有真实开盘价和真实最高价，直接计算
+                df['真实最高价相对开盘价涨幅(%)'] = np.where(
+                    (df['真实开盘价'].notna()) & (df['真实开盘价'] > 0),
+                    (df['真实最高价'] - df['真实开盘价']) / df['真实开盘价'] * 100,
+                    np.nan
+                )
+            else:
+                logger.debug("未找到真实开盘价或真实最高价列，跳过真实涨幅计算")
+                df['真实最高价相对开盘价涨幅(%)'] = np.nan
+            
+            # 3. 计算两个涨幅之间的误差
+            df['涨幅误差(%)'] = np.where(
+                (df['预测最高价相对开盘价涨幅(%)'].notna()) & 
+                (df['真实最高价相对开盘价涨幅(%)'].notna()),
+                df['预测最高价相对开盘价涨幅(%)'] - df['真实最高价相对开盘价涨幅(%)'],
+                np.nan
+            )
+            
+            # 移除不需要的辅助列（如果存在）
+            columns_to_remove = ['最新日期收盘价', '真实开盘价缺失']
+            for col in columns_to_remove:
+                if col in df.columns:
+                    df = df.drop(columns=[col])
+            
+            # 统计信息
+            has_prediction = df['预测最高价相对开盘价涨幅(%)'].notna().sum()
+            has_real = df['真实最高价相对开盘价涨幅(%)'].notna().sum()
+            has_error = df['涨幅误差(%)'].notna().sum()
+            
+            logger.info(f"  预测涨幅计算: {has_prediction}/{len(df)} 条记录")
+            logger.info(f"  真实涨幅计算: {has_real}/{len(df)} 条记录")
+            logger.info(f"  涨幅误差计算: {has_error}/{len(df)} 条记录")
+            
+            if has_error > 0:
+                logger.info(f"  涨幅误差统计: 平均={df['涨幅误差(%)'].mean():.4f}%, "
+                          f"中位数={df['涨幅误差(%)'].median():.4f}%, "
+                          f"标准差={df['涨幅误差(%)'].std():.4f}%")
+            
+            return df
+            
+        except Exception as e:
+            logger.warning(f"计算涨幅列失败: {str(e)}")
+            logger.debug(traceback.format_exc())
+            return df
     
     def _create_summary_sheet(self, writer, data_df):
         """创建摘要表"""

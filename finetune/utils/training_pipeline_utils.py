@@ -740,7 +740,11 @@ def predict_future_trends(tokenizer, model, test_data, config, device, save_dir=
                 # x_means_batch / x_stds_batch 形状: (batch, feature_dim)
                 x_means_np = x_means_batch.numpy()
                 x_stds_np = x_stds_batch.numpy()
-                preds_np = preds.cpu().numpy()
+                # 处理 preds 可能是 torch tensor 或 numpy 数组的情况
+                if isinstance(preds, torch.Tensor):
+                    preds_np = preds.cpu().numpy()
+                else:
+                    preds_np = preds
                 preds_denorm = preds_np * x_stds_np[:, None, :] + x_means_np[:, None, :]
                 
                 # 获取特征在 feature_list 中的索引
